@@ -41,3 +41,4 @@ class FuzzConfig:
 
     # --- Reducer ----------------------------------------------------------------
     reduce_on_failure: bool = True
+    max_reduction_steps: int = 50

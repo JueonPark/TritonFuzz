@@ -41,6 +41,8 @@ class Generator:
 
     def __init__(self, *, extra_config: Optional[dict] = None) -> None:
         self._extra_config = extra_config or {}
+        self._max_body_ops: int | None = self._extra_config.get("max_body_ops")
+        self._max_inputs: int | None = self._extra_config.get("max_inputs")
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -57,7 +59,7 @@ class Generator:
         GeneratedKernel
         """
         rng = random.Random(seed)
-        builder = KernelBuilder(seed, rng)
+        builder = KernelBuilder(seed, rng, extra_config=self._extra_config)
         triton_src, torch_src, metadata = builder.build()
 
         # Sanity-check: ensure both sources are valid Python.

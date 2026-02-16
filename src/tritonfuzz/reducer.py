@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -421,11 +423,15 @@ class Reducer:
         Uses a 1-minimal delta-debugging strategy: try removing each op
         one at a time (in reverse order), keep the removal if the bug
         persists, then restart until no more removals are possible.
+
+        Respects ``FuzzConfig.max_reduction_steps`` to bound the total
+        number of re-test invocations across all pruning passes.
         """
         steps: list[str] = []
         changed = True
+        budget = self._config.max_reduction_steps
 
-        while changed:
+        while changed and budget > 0:
             changed = False
             triton_lines = triton_src.splitlines()
             torch_lines = torch_src.splitlines()
@@ -464,6 +470,11 @@ class Reducer:
                     continue
                 if match is not None and not _is_valid_python(new_torch):
                     continue
+
+                budget -= 1
+                if budget <= 0:
+                    steps.append("Pruning budget exhausted")
+                    break
 
                 if self._reproduces(
                     new_triton, new_torch, metadata,
@@ -663,8 +674,6 @@ class Reducer:
           ``LLVM_IR_ENABLE_DUMP=1``
           ``NVPTX_ENABLE_DUMP=1`` (CUDA) / ``AMD_GCN_ENABLE_DUMP=1`` (HIP)
         """
-        from tritonfuzz.generator import GeneratedKernel
-
         # Determine backend from the driver's target context
         backend = "cuda"
         if (
@@ -676,38 +685,59 @@ class Reducer:
         env_vars = dict(_ARTIFACT_ENV_VARS)
         env_vars.update(_BACKEND_DUMP_VARS.get(backend, {}))
 
-        # Save and override environment
-        saved: dict[str, Optional[str]] = {}
-        for k, v in env_vars.items():
-            saved[k] = os.environ.get(k)
-            os.environ[k] = v
+        # Launch compilation in a subprocess to capture stdout/stderr
+        # (Triton and LLVM dump to stdout/stderr when the env vars are set).
+        wrapper = (
+            "import ast, sys, json\n"
+            "from tritonfuzz.generator import GeneratedKernel\n"
+            "from tritonfuzz.driver import Driver\n"
+            "from tritonfuzz.config import FuzzConfig\n"
+            f"meta = {metadata!r}\n"
+            f"src = {triton_src!r}\n"
+            "mk = GeneratedKernel(\n"
+            f"    seed={seed},\n"
+            "    triton_source=src,\n"
+            "    torch_ref_source='',\n"
+            "    triton_ast=ast.parse(src),\n"
+            "    torch_ref_ast=ast.parse('pass'),\n"
+            "    metadata=meta,\n"
+            ")\n"
+            "cfg = FuzzConfig()\n"
+            "drv = Driver(cfg)\n"
+            "comp = drv.compile(mk)\n"
+            "print('SUCCESS' if comp.success else 'FAIL', file=sys.stderr)\n"
+        )
 
+        sub_env = {**os.environ, **env_vars}
         try:
-            mk = GeneratedKernel(
-                seed=seed,
-                triton_source=triton_src,
-                torch_ref_source="",
-                triton_ast=ast.parse(triton_src),
-                torch_ref_ast=ast.parse("pass"),
-                metadata=metadata,
+            proc = subprocess.run(
+                [sys.executable, "-c", wrapper],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=sub_env,
             )
-            comp = self._driver.compile(mk)
-            status = "succeeded" if comp.success else f"failed: {comp.error}"
+            stdout_log = proc.stdout
+            stderr_log = proc.stderr
+            status = f"returncode={proc.returncode}"
+        except subprocess.TimeoutExpired:
+            stdout_log = ""
+            stderr_log = ""
+            status = "subprocess timed out"
         except Exception as exc:  # noqa: BLE001
+            stdout_log = ""
+            stderr_log = ""
             status = f"exception: {exc}"
-        finally:
-            # Restore original environment
-            for k, orig in saved.items():
-                if orig is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = orig
 
         (dump_dir / "compile_status.txt").write_text(
             f"Compilation {status}\n"
             f"Environment: {env_vars}\n"
             f"Options: {compile_options}\n",
         )
+        if stdout_log:
+            (dump_dir / "stdout.log").write_text(stdout_log)
+        if stderr_log:
+            (dump_dir / "stderr.log").write_text(stderr_log)
 
     # ── Reproducer script generation ──────────────────────────────────────
 

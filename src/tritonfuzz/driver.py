@@ -20,9 +20,11 @@ Backends handled:
 
 from __future__ import annotations
 
+import atexit
 import importlib
 import logging
 import random
+import shutil
 import sys
 import tempfile
 import types
@@ -172,6 +174,8 @@ class CompilerDriver:
         # ── Step 1: persist source to a temp file ────────────────────────
         fn_name = kernel.metadata.get("kernel_fn_name", f"triton_kernel_seed_{kernel.seed}")
         tmp_dir = Path(tempfile.mkdtemp(prefix="tritonfuzz_"))
+        # Register cleanup so temp dirs don't leak over a long campaign.
+        atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
         src_path = tmp_dir / f"{fn_name}.py"
         src_path.write_text(kernel.triton_source)
 
@@ -181,7 +185,9 @@ class CompilerDriver:
 
         # ── Step 3: build signature from metadata ────────────────────────
         num_inputs = kernel.metadata.get("num_inputs", 1)
-        sig = self._build_signature(num_inputs)
+        input_dtypes = kernel.metadata.get("input_dtypes")
+        output_dtype = kernel.metadata.get("output_dtype")
+        sig = self._build_signature(num_inputs, input_dtypes, output_dtype)
 
         # ── Step 4: resolve target and compile ───────────────────────────
         triton_target = self._target_ctx.get_triton_target()
@@ -207,18 +213,54 @@ class CompilerDriver:
         spec.loader.exec_module(mod)
         return mod
 
-    @staticmethod
-    def _build_signature(num_inputs: int) -> dict[int, str]:
+    # ── Dtype → Triton signature string mapping ────────────────────────
+
+    _TORCH_DTYPE_TO_SIG: dict[str, str] = {
+        "torch.float16":  "*fp16",
+        "torch.bfloat16": "*bf16",
+        "torch.float32":  "*fp32",
+        "torch.float64":  "*fp64",
+        "torch.int8":     "*i8",
+        "torch.int16":    "*i16",
+        "torch.int32":    "*i32",
+        "torch.int64":    "*i64",
+        "torch.bool":     "*i1",
+    }
+
+    @classmethod
+    def _build_signature(
+        cls,
+        num_inputs: int,
+        input_dtypes: list[str] | None = None,
+        output_dtype: str | None = None,
+    ) -> dict[int, str]:
         """Build the positional-argument signature dict for ``triton.compile``.
 
         Layout: ``in_ptr0, in_ptr1, …, out_ptr, n_elements`` (constexprs excluded).
+
+        Parameters
+        ----------
+        num_inputs:
+            Number of input pointer arguments.
+        input_dtypes:
+            List of PyTorch dtype strings (e.g. ``["torch.float32", "torch.int32"]``).
+            If ``None`` or shorter than *num_inputs*, missing entries default to
+            ``"*fp32"``.
+        output_dtype:
+            PyTorch dtype string for the output pointer. Defaults to ``"*fp32"``.
         """
         sig: dict[int, str] = {}
         pos = 0
-        for _ in range(num_inputs):
-            sig[pos] = "*fp32"
+        for i in range(num_inputs):
+            dt_str = (
+                input_dtypes[i]
+                if input_dtypes is not None and i < len(input_dtypes)
+                else "torch.float32"
+            )
+            sig[pos] = cls._TORCH_DTYPE_TO_SIG.get(dt_str, "*fp32")
             pos += 1
-        sig[pos] = "*fp32"     # out_ptr
+        out_sig = cls._TORCH_DTYPE_TO_SIG.get(output_dtype or "", "*fp32")
+        sig[pos] = out_sig     # out_ptr
         pos += 1
         sig[pos] = "i32"      # n_elements
         return sig

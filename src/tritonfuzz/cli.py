@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 
 from tritonfuzz.config import FuzzConfig
 from tritonfuzz.fuzzer import Fuzzer
@@ -99,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         sweep_count=args.sweep_count,
         atol=args.atol,
         rtol=args.rtol,
-        output_dir=args.output_dir,
+        output_dir=Path(args.output_dir),
     )
 
     # --- Run ----------------------------------------------------------------

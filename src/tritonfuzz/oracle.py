@@ -220,6 +220,17 @@ class Oracle:
         test = exec_result.test_output
         metadata = exec_result.metadata
 
+        # --- Shape guard — catch mismatches early -------------------------
+        if golden.shape != test.shape:
+            return VerificationResult(
+                seed=seed,
+                verdict=Verdict.FAIL,
+                message=(
+                    f"Output shape mismatch: golden={golden.shape}, "
+                    f"test={test.shape}"
+                ),
+            )
+
         # --- Phase 1: NaN / Inf consistency (§6.2) ------------------------
         nan_result = self._check_nan_consistency(seed, golden, test)
         if nan_result is not None:
@@ -243,9 +254,6 @@ class Oracle:
         Used by the fuzzer's sweep-mode divergence check (§5.5).
         """
         return bool(torch.allclose(a, b, atol=self._config.atol, rtol=self._config.rtol))
-
-    # kept as private alias for backward compat with fuzzer code
-    _tensors_close = tensors_close
 
     # ── Phase 1: NaN / Inf consistency (§6.2) ────────────────────────────
 

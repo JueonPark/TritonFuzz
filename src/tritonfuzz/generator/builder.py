@@ -55,10 +55,11 @@ class KernelBuilder:
         triton_src, torch_src, metadata = builder.build()
     """
 
-    def __init__(self, seed: int, rng: random.Random) -> None:
+    def __init__(self, seed: int, rng: random.Random, *, extra_config: Optional[dict] = None) -> None:
         self.seed = seed
         self.rng = rng
         self.symtab = SymbolTable()
+        self._extra_config = extra_config or {}
 
         # ── Configuration (decided in _plan) ─────────────────────────────
         self.num_inputs: int = 0
@@ -135,6 +136,17 @@ class KernelBuilder:
                 idx = rng.randint(0, self.num_inputs - 1)
                 self.input_dtypes[idx] = pick_input_dtype(rng)
                 attempts += 1
+
+        # ── Apply extra_config overrides ─────────────────────────────────
+        if "max_body_ops" in self._extra_config:
+            self.num_body_ops = min(
+                self.num_body_ops, int(self._extra_config["max_body_ops"]),
+            )
+        if "max_inputs" in self._extra_config:
+            cap = int(self._extra_config["max_inputs"])
+            if self.num_inputs > cap:
+                self.num_inputs = cap
+                self.input_dtypes = self.input_dtypes[:cap]
 
     # ================================================================== #
     #  Phase 2 – Emit loads (§4.2.1)                                       #

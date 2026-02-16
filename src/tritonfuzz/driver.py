@@ -170,6 +170,7 @@ class CompilerDriver:
           4. Return the ``CompiledKernel`` handle.
         """
         import triton
+        from triton.compiler.compiler import ASTSource
 
         # ── Step 1: persist source to a temp file ────────────────────────
         fn_name = kernel.metadata.get("kernel_fn_name", f"triton_kernel_seed_{kernel.seed}")
@@ -187,16 +188,19 @@ class CompilerDriver:
         num_inputs = kernel.metadata.get("num_inputs", 1)
         input_dtypes = kernel.metadata.get("input_dtypes")
         output_dtype = kernel.metadata.get("output_dtype")
-        sig = self._build_signature(num_inputs, input_dtypes, output_dtype)
+        sig = self._build_signature(jit_fn, num_inputs, input_dtypes, output_dtype)
 
-        # ── Step 4: resolve target and compile ───────────────────────────
+        # ── Step 4: build constexprs for tl.constexpr parameters ─────────
+        constexprs = self._build_constexprs(kernel, jit_fn)
+
+        # ── Step 5: wrap in ASTSource and compile ────────────────────────
         triton_target = self._target_ctx.get_triton_target()
+        ast_src = ASTSource(fn=jit_fn, signature=sig, constexprs=constexprs)
 
         compiled = triton.compile(
-            fn=jit_fn,
-            signature=sig,
+            src=ast_src,
             target=triton_target,
-            **options,
+            options=options,
         )
         return compiled
 
@@ -230,16 +234,21 @@ class CompilerDriver:
     @classmethod
     def _build_signature(
         cls,
+        jit_fn: Any,
         num_inputs: int,
         input_dtypes: list[str] | None = None,
         output_dtype: str | None = None,
-    ) -> dict[int, str]:
+    ) -> dict[str, str]:
         """Build the positional-argument signature dict for ``triton.compile``.
 
         Layout: ``in_ptr0, in_ptr1, …, out_ptr, n_elements`` (constexprs excluded).
+        Keys are parameter *names* (strings), matching the current Triton API.
+        Parameters marked ``tl.constexpr`` are excluded from the signature.
 
         Parameters
         ----------
+        jit_fn:
+            The ``@triton.jit``-decorated function.
         num_inputs:
             Number of input pointer arguments.
         input_dtypes:
@@ -249,7 +258,19 @@ class CompilerDriver:
         output_dtype:
             PyTorch dtype string for the output pointer. Defaults to ``"*fp32"``.
         """
-        sig: dict[int, str] = {}
+        # Collect non-constexpr parameter names from the JIT function.
+        import triton.language as tl
+        import inspect
+
+        params = list(inspect.signature(jit_fn.fn).parameters.values())
+        non_constexpr_names: list[str] = []
+        for p in params:
+            # Skip parameters annotated as tl.constexpr
+            if p.annotation is tl.constexpr:
+                continue
+            non_constexpr_names.append(p.name)
+
+        sig: dict[str, str] = {}
         pos = 0
         for i in range(num_inputs):
             dt_str = (
@@ -257,10 +278,33 @@ class CompilerDriver:
                 if input_dtypes is not None and i < len(input_dtypes)
                 else "torch.float32"
             )
-            sig[pos] = cls._TORCH_DTYPE_TO_SIG.get(dt_str, "*fp32")
+            name = non_constexpr_names[pos] if pos < len(non_constexpr_names) else f"arg{pos}"
+            sig[name] = cls._TORCH_DTYPE_TO_SIG.get(dt_str, "*fp32")
             pos += 1
+        # out_ptr
         out_sig = cls._TORCH_DTYPE_TO_SIG.get(output_dtype or "", "*fp32")
-        sig[pos] = out_sig     # out_ptr
+        name = non_constexpr_names[pos] if pos < len(non_constexpr_names) else f"arg{pos}"
+        sig[name] = out_sig
         pos += 1
-        sig[pos] = "i32"      # n_elements
+        # n_elements
+        name = non_constexpr_names[pos] if pos < len(non_constexpr_names) else f"arg{pos}"
+        sig[name] = "i32"
         return sig
+
+    @staticmethod
+    def _build_constexprs(kernel: GeneratedKernel, jit_fn: Any) -> dict[str, Any]:
+        """Build the constexprs dict from metadata (e.g. ``BLOCK_SIZE``)."""
+        import triton.language as tl
+        import inspect
+
+        constexprs: dict[str, Any] = {}
+        params = list(inspect.signature(jit_fn.fn).parameters.values())
+        for p in params:
+            if p.annotation is tl.constexpr:
+                # Look up the value in metadata (e.g. block_size → BLOCK_SIZE)
+                key_lower = p.name.lower()
+                if key_lower in kernel.metadata:
+                    constexprs[p.name] = kernel.metadata[key_lower]
+                elif p.name in kernel.metadata:
+                    constexprs[p.name] = kernel.metadata[p.name]
+        return constexprs

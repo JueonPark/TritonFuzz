@@ -9,9 +9,16 @@ Responsibilities:
 
 from __future__ import annotations
 
+import atexit
+import importlib
 import logging
+import shutil
+import sys
+import tempfile
 import threading
+import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -199,21 +206,45 @@ class Runtime:
         out = torch.empty(n_elements, device=self._device, dtype=output_dtype)
 
         # The compiled kernel needs to be launched via the JIT function.
-        # Re-exec the kernel source to get the JIT function and launch it.
-        kernel_ns: dict[str, Any] = {}
-        exec(
-            compile(kernel.triton_source, f"<triton_kernel_seed_{kernel.seed}>", "exec"),
-            kernel_ns,
-        )
-
-        fn_name = meta.get("kernel_fn_name", f"triton_kernel_seed_{kernel.seed}")
-        jit_fn = kernel_ns.get(fn_name)
-        if jit_fn is None:
-            raise RuntimeError(
-                f"Triton kernel function '{fn_name}' not found in exec'd module"
-            )
+        # Write source to a temp file and import it — Triton requires @jit
+        # functions to live in real Python files.
+        jit_fn = self._load_jit_fn_from_source(kernel)
 
         grid = ((n_elements + block_size - 1) // block_size,)
         jit_fn[grid](*inputs, out, n_elements, BLOCK_SIZE=block_size)
 
         return out
+
+    # --------------------------------------------------------------------- #
+    # Module loading helpers                                                 #
+    # --------------------------------------------------------------------- #
+
+    @staticmethod
+    def _import_module_from_path(module_name: str, path: Path) -> types.ModuleType:
+        """Dynamically import a Python module from an absolute file path."""
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot create module spec from {path}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _load_jit_fn_from_source(self, kernel: GeneratedKernel) -> Any:
+        """Write kernel source to a temp file, import it, and return the JIT function."""
+        meta = kernel.metadata
+        fn_name = meta.get("kernel_fn_name", f"triton_kernel_seed_{kernel.seed}")
+        # Use a unique module name to avoid collisions across seeds/reductions.
+        module_name = f"_tritonfuzz_rt_{fn_name}_{id(kernel)}"
+        tmp_dir = Path(tempfile.mkdtemp(prefix="tritonfuzz_rt_"))
+        atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+        src_path = tmp_dir / f"{module_name}.py"
+        src_path.write_text(kernel.triton_source)
+
+        mod = self._import_module_from_path(module_name, src_path)
+        jit_fn = getattr(mod, fn_name, None)
+        if jit_fn is None:
+            raise RuntimeError(
+                f"Triton kernel function '{fn_name}' not found in imported module"
+            )
+        return jit_fn

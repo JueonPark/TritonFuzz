@@ -798,6 +798,9 @@ class Reducer:
         rfn = metadata.get("ref_fn_name", f"torch_ref_seed_{seed}")
         dtypes = metadata.get("input_dtypes", ["torch.float32"] * n_in)
 
+        # Integer dtypes that need torch.randint instead of torch.randn
+        _INT_DTYPES = {"torch.int8", "torch.int16", "torch.int32", "torch.int64", "torch.bool"}
+
         # Build input allocation lines
         allocs: list[str] = []
         names: list[str] = []
@@ -805,14 +808,20 @@ class Reducer:
             dt = dtypes[i] if i < len(dtypes) else "torch.float32"
             nm = f"x{i}"
             names.append(nm)
-            allocs.append(
-                f'{nm} = torch.randn({ne}, device="cuda", dtype={dt})'
-            )
+            if dt in _INT_DTYPES:
+                allocs.append(
+                    f'{nm} = torch.randint(-127, 128, ({ne},), device="cuda", dtype={dt})'
+                )
+            else:
+                allocs.append(
+                    f'{nm} = torch.randn({ne}, device="cuda", dtype={dt})'
+                )
 
         alloc_block = "\n    ".join(allocs)
         ptr_args = ", ".join(names)
         ref_args = ", ".join(names)
-        out_dt = dtypes[0] if dtypes else "torch.float32"
+        out_dt = metadata.get("output_dtype", dtypes[0] if dtypes else "torch.float32")
+        output_init = metadata.get("output_init", "empty")
         grid_expr = f"({ne} + {bs} - 1) // {bs}"
 
         # Build the script as plain strings (no nested f-strings)
@@ -837,8 +846,27 @@ class Reducer:
             "\n\n",
             "def main():\n",
             f"    {alloc_block}\n",
-            f"    out = torch.empty({ne}, "
-            f'device="cuda", dtype={out_dt})\n',
+        ]
+
+        # Output tensor initialisation (atomic ops need specific init)
+        if output_init == "zeros":
+            parts.append(
+                f'    out = torch.zeros({ne}, device="cuda", dtype={out_dt})\n'
+            )
+        elif output_init == "neg_inf":
+            parts.append(
+                f'    out = torch.full(({ne},), float("-inf"), device="cuda", dtype={out_dt})\n'
+            )
+        elif output_init == "pos_inf":
+            parts.append(
+                f'    out = torch.full(({ne},), float("inf"), device="cuda", dtype={out_dt})\n'
+            )
+        else:
+            parts.append(
+                f'    out = torch.empty({ne}, device="cuda", dtype={out_dt})\n'
+            )
+
+        parts += [
             "\n",
             "    # Golden output\n",
             f"    golden = {rfn}({ref_args})\n",
@@ -848,7 +876,7 @@ class Reducer:
             f"    {kfn}[grid]({ptr_args}, out, {ne}, BLOCK_SIZE={bs})\n",
             "\n",
             "    # Compare\n",
-            "    if torch.allclose(golden, out, atol=1e-2, rtol=1e-2):\n",
+            "    if torch.allclose(golden.float(), out.float(), atol=1e-2, rtol=1e-2, equal_nan=True):\n",
             '        print("PASS")\n',
             "    else:\n",
             "        diff = (golden.float() - out.float()).abs()\n",

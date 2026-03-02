@@ -415,13 +415,26 @@ class Oracle:
                 ),
             )
 
+        # --- Mask out NaN/Inf (already validated in phase 1) ---
+        if golden.is_floating_point():
+            valid = ~torch.isnan(golden) & ~torch.isnan(test)
+            golden_v = golden[valid].float()
+            test_v = test[valid].float()
+        else:
+            golden_v = golden.flatten().float()
+            test_v = test.flatten().float()
+
+        if golden_v.numel() == 0:
+            # Entire tensor is NaN — already handled in phase 1
+            return VerificationResult(seed=seed, verdict=Verdict.PASS)
+
         # --- Global sum check ---
-        golden_sum = golden.float().sum()
-        test_sum = test.float().sum()
+        golden_sum = golden_v.sum()
+        test_sum = test_v.sum()
         atol, rtol = _compute_effective_tolerance(
             self._config.atol, self._config.rtol, ops_used, golden.dtype,
         )
-        sum_close = bool(torch.allclose(golden_sum, test_sum, atol=atol * golden.numel(), rtol=rtol))
+        sum_close = bool(torch.allclose(golden_sum, test_sum, atol=atol * golden_v.numel(), rtol=rtol))
 
         if not sum_close:
             diff = (golden_sum - test_sum).abs().item()
@@ -438,8 +451,8 @@ class Oracle:
             )
 
         # --- Sorted-histogram check ---
-        golden_sorted = golden.flatten().float().sort().values
-        test_sorted = test.flatten().float().sort().values
+        golden_sorted = golden_v.sort().values
+        test_sorted = test_v.sort().values
         sorted_close = bool(torch.allclose(golden_sorted, test_sorted, atol=atol, rtol=rtol))
 
         if not sorted_close:

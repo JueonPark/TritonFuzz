@@ -117,6 +117,9 @@ _OP_TOLERANCE_MULTIPLIERS: dict[str, float] = {
     "sqrt": 1.5,
     "div":  1.5,
     "dot":  3.0,
+    "reduce_sum": 2.0,
+    "reduce_max": 1.5,
+    "reduce_min": 1.5,
 }
 
 # Output dtype → base tolerance override.

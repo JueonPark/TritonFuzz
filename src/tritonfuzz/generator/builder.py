@@ -28,6 +28,7 @@ from tritonfuzz.generator.ops import (
     pick_atomic_op,
     pick_category,
     pick_op_from_category,
+    pick_reduction_op,
 )
 from tritonfuzz.generator.symbol_table import SymbolTable, TensorVar
 from tritonfuzz.generator.types import (
@@ -303,6 +304,10 @@ class KernelBuilder:
             self._emit_cast(indent)
             return
 
+        if category == OpCategory.REDUCTION:
+            self._emit_reduction(indent)
+            return
+
         # For the LOGIC category, half the time emit ``where`` instead of
         # min/max so that we exercise predicate-based branching (§4.3).
         if category == OpCategory.LOGIC and rng.random() > 0.5:
@@ -420,6 +425,61 @@ class KernelBuilder:
 
         self.symtab.add(TensorVar(out_name, target_dtype, is_block=True, shape=src.shape))
         self._ops_used.append(f"cast_to_{target_dtype.short}")
+
+    # ── Reduction emission (tl.sum / tl.max / tl.min) ───────────────────
+
+    def _emit_reduction(self, indent: str = "") -> None:
+        """Emit a reduction followed by a broadcast-back binary op.
+
+        Pattern::
+
+            v_N_red = tl.sum(v_M, axis=0)      # scalar
+            v_N     = v_K + v_N_red             # broadcast back to block
+
+        This exercises the Triton compiler's reduction lowering while
+        keeping the final registered variable block-shaped so that
+        subsequent ops and the store epilogue work unchanged.
+
+        Only operates on 1D block variables (``shape == ()``).  In dot
+        mode all variables are 2D, so this gracefully becomes a no-op.
+        """
+        rng = self.rng
+
+        # Pick a 1D block variable to reduce
+        inp = self.symtab.pick_random(rng, is_block=True, require_float=True, shape=())
+        if inp is None:
+            inp = self.symtab.pick_random(rng, is_block=True, shape=())
+        if inp is None:
+            return  # no 1D blocks available (e.g. dot mode)
+
+        red_op = pick_reduction_op(rng)
+
+        # Emit the reduction → scalar
+        scalar_name = self.symtab.fresh_name("r")
+        self._triton_body.append(
+            f"{indent}{scalar_name} = {red_op.triton_fmt.format(inp.name)}"
+        )
+        self._torch_body.append(
+            f"{indent}{scalar_name} = {red_op.torch_fmt.format(inp.name)}"
+        )
+
+        # Broadcast back: combine scalar with a block variable
+        block_var = self.symtab.pick_random(rng, is_block=True, shape=())
+        if block_var is None:
+            return
+
+        out_name = self.symtab.fresh_name("v")
+        accum_op = rng.choice(["+", "*"])
+        self._triton_body.append(
+            f"{indent}{out_name} = {block_var.name} {accum_op} {scalar_name}"
+        )
+        self._torch_body.append(
+            f"{indent}{out_name} = {block_var.name} {accum_op} {scalar_name}"
+        )
+
+        out_dt = promote(block_var.dtype, inp.dtype)
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=block_var.shape))
+        self._ops_used.append(red_op.name)
 
     # ── For-loop emission (§4.3 Control Flow) ────────────────────────────
 
@@ -615,7 +675,7 @@ class KernelBuilder:
 
     def _build_metadata(self) -> dict:
         meta = {
-            "generator_version": "0.3.0",
+            "generator_version": "0.4.0",
             "seed": self.seed,
             "num_inputs": self.num_inputs,
             "input_dtypes": [d.torch for d in self.input_dtypes],

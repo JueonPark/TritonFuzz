@@ -39,8 +39,9 @@ class OpCategory(str, Enum):
     ATOMIC             = "atomic"
     DOT                = "dot"
 
-    # Future stubs
     REDUCTION    = "reduction"
+
+    # Future stubs
     POINTER_MATH = "pointer_math"
 
 
@@ -141,6 +142,38 @@ def pick_atomic_op(rng: random.Random) -> AtomicOpTemplate:
     weights = [op.weight for op in ATOMIC_OPS]
     return rng.choices(ATOMIC_OPS, weights=weights, k=1)[0]
 
+
+# ── Reduction operations (tl.sum, tl.max, tl.min) ───────────────────────────
+
+
+@dataclass(frozen=True)
+class ReductionOpTemplate:
+    """Describes a reduction operation that collapses a block to a scalar.
+
+    The builder emits the reduction then immediately combines the scalar
+    result with a block-shaped variable (broadcasting), so the final
+    registered variable remains block-shaped and can be stored normally.
+    """
+
+    name: str
+    triton_fmt: str   # e.g. "tl.sum({0}, axis=0)"
+    torch_fmt: str    # e.g. "torch.sum({0})"
+    weight: float = 1.0
+    requires_float: bool = False
+
+
+REDUCTION_OPS: list[ReductionOpTemplate] = [
+    ReductionOpTemplate("reduce_sum", "tl.sum({0}, axis=0)",  "torch.sum({0})",  3.0, False),
+    ReductionOpTemplate("reduce_max", "tl.max({0}, axis=0)",  "torch.max({0})",  2.0, False),
+    ReductionOpTemplate("reduce_min", "tl.min({0}, axis=0)",  "torch.min({0})",  2.0, False),
+]
+
+
+def pick_reduction_op(rng: random.Random) -> ReductionOpTemplate:
+    """Weighted random selection of a reduction operation."""
+    weights = [op.weight for op in REDUCTION_OPS]
+    return rng.choices(REDUCTION_OPS, weights=weights, k=1)[0]
+
 # ── Convenience aggregates ───────────────────────────────────────────────────
 
 ALL_TEMPLATE_OPS: list[OpTemplate] = UNARY_OPS + BINARY_OPS + LOGIC_BINARY_OPS
@@ -152,6 +185,7 @@ CATEGORY_WEIGHTS: dict[OpCategory, float] = {
     OpCategory.ELEMENTWISE_BINARY: 4.0,
     OpCategory.LOGIC:              2.0,
     OpCategory.TYPE_CAST:          1.5,
+    OpCategory.REDUCTION:          1.5,
 }
 
 # ── Comparison primitives for ``tl.where`` condition expressions ─────────────

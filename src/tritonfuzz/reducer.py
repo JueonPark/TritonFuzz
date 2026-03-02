@@ -791,6 +791,12 @@ class Reducer:
         The script embeds both the Triton kernel and the PyTorch reference,
         allocates inputs according to metadata, and runs the comparison.
         """
+        # Dot kernels have a completely different launch pattern
+        if metadata.get("use_dot"):
+            return Reducer._build_dot_repro_script(
+                seed, triton_src, torch_src, metadata, compile_options,
+            )
+
         bs = metadata.get("block_size", 256)
         ne = metadata.get("n_elements", 1024)
         n_in = metadata.get("num_inputs", 1)
@@ -884,6 +890,80 @@ class Reducer:
             ' {diff.max().item():.6e}")\n',
             '        print(f"  golden[:8]: {golden[:8]}")\n',
             '        print(f"  triton[:8]: {out[:8]}")\n',
+            "\n\n",
+            'if __name__ == "__main__":\n',
+            "    main()\n",
+        ]
+        return "".join(parts)
+
+    @staticmethod
+    def _build_dot_repro_script(
+        seed: int,
+        triton_src: str,
+        torch_src: str,
+        metadata: dict,
+        compile_options: dict,
+    ) -> str:
+        """Generate a standalone reproducer for a dot-product kernel."""
+        kfn = metadata.get("kernel_fn_name", f"triton_kernel_seed_{seed}")
+        rfn = metadata.get("ref_fn_name", f"torch_ref_seed_{seed}")
+        M = metadata.get("dot_M", 128)
+        N = metadata.get("dot_N", 128)
+        K = metadata.get("dot_K", 64)
+        BM = metadata.get("dot_BLOCK_M", 32)
+        BN = metadata.get("dot_BLOCK_N", 32)
+        BK = metadata.get("dot_BLOCK_K", 32)
+        dt = metadata.get("input_dtypes", ["torch.float32"])[0]
+
+        parts: list[str] = [
+            "#!/usr/bin/env python3\n",
+            f'"""Minimal reproducer for TritonFuzz seed {seed} (dot kernel).\n',
+            "\n",
+            "To capture full IR dumps, run with:\n",
+            "  MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 \\\n",
+            "  LLVM_IR_ENABLE_DUMP=1 \\\n",
+            "  NVPTX_ENABLE_DUMP=1 python reproduce.py\n",
+            '"""\n',
+            "import torch\n",
+            "\n",
+            "# ── Triton kernel "
+            "────────────────────────────────────────────────\n",
+            triton_src,
+            "\n",
+            "# ── PyTorch reference "
+            "────────────────────────────────────────────\n",
+            torch_src,
+            "\n\n",
+            "def main():\n",
+            f"    M, N, K = {M}, {N}, {K}\n",
+            f"    BLOCK_M, BLOCK_N, BLOCK_K = {BM}, {BN}, {BK}\n",
+            f'    a = torch.randn(M, K, device="cuda", dtype={dt})\n',
+            f'    b = torch.randn(K, N, device="cuda", dtype={dt})\n',
+            f'    out = torch.empty(M, N, device="cuda", dtype=torch.float32)\n',
+            "\n",
+            "    # Golden output\n",
+            f"    golden = {rfn}(a, b)\n",
+            "\n",
+            "    # Triton output\n",
+            "    grid = (M // BLOCK_M, N // BLOCK_N)\n",
+            f"    {kfn}[grid](\n",
+            "        a, b, out,\n",
+            "        M, N, K,\n",
+            "        a.stride(0), a.stride(1),\n",
+            "        b.stride(0), b.stride(1),\n",
+            "        out.stride(0), out.stride(1),\n",
+            "        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n",
+            "    )\n",
+            "\n",
+            "    # Compare\n",
+            "    if torch.allclose(golden.float(), out.float(), atol=1e-2, rtol=1e-2, equal_nan=True):\n",
+            '        print("PASS")\n',
+            "    else:\n",
+            "        diff = (golden.float() - out.float()).abs()\n",
+            '        print(f"FAIL — max_abs_diff:'
+            ' {diff.max().item():.6e}")\n',
+            '        print(f"  golden[:4,:4]: {golden[:4,:4]}")\n',
+            '        print(f"  triton[:4,:4]: {out[:4,:4]}")\n',
             "\n\n",
             'if __name__ == "__main__":\n',
             "    main()\n",

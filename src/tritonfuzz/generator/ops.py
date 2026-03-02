@@ -37,10 +37,10 @@ class OpCategory(str, Enum):
     LOGIC              = "logic"
     TYPE_CAST          = "type_cast"
     ATOMIC             = "atomic"
+    DOT                = "dot"
 
     # Future stubs
     REDUCTION    = "reduction"
-    DOT          = "dot"
     POINTER_MATH = "pointer_math"
 
 

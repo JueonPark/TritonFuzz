@@ -337,8 +337,11 @@ class Reducer:
         steps.extend(t_steps)
 
         # ── §7.2 Artifact Collection ─────────────────────────────────────
+        # Determine verdict label for directory naming
+        verdict_label = target_verdict.value if hasattr(target_verdict, 'value') else str(target_verdict)
         artifact_path = self._collect_artifacts(
             kernel.seed, triton_src, torch_src, metadata, compile_opts,
+            verdict_label=verdict_label,
         )
         if artifact_path is not None:
             steps.append(f"Artifacts → {artifact_path}")
@@ -599,6 +602,39 @@ class Reducer:
 
     # ── §7.2: Artifact Collection ─────────────────────────────────────────
 
+    def save_compile_error(
+        self,
+        kernel,            # GeneratedKernel
+        error_message: str,
+        compile_options: dict | None = None,
+    ) -> Optional[Path]:
+        """Save artifacts for a compile-error case (no reduction needed).
+
+        Parameters
+        ----------
+        kernel : GeneratedKernel
+            The generated kernel that failed to compile.
+        error_message : str
+            The compilation error message.
+        compile_options : dict, optional
+            The compile options that were used (if available).
+
+        Returns
+        -------
+        Path or None
+            Path to the saved artifact directory/zip, or ``None`` on I/O error.
+        """
+        triton_src = kernel.triton_source
+        torch_src = kernel.torch_ref_source
+        metadata = dict(kernel.metadata)
+        metadata["compile_error"] = error_message
+        opts = compile_options or {}
+
+        return self._collect_artifacts(
+            kernel.seed, triton_src, torch_src, metadata, opts,
+            verdict_label="compile_error",
+        )
+
     def _collect_artifacts(
         self,
         seed: int,
@@ -606,13 +642,14 @@ class Reducer:
         torch_src: str,
         metadata: dict,
         compile_options: dict,
+        verdict_label: str = "fail",
     ) -> Optional[Path]:
         """Write reproducer, IR dumps, and metadata; package into a zip.
 
         Returns the path to the zip file, or the output directory on
         failure, or ``None`` if the directory could not be created.
         """
-        out_dir = self._config.output_dir / f"seed_{seed}"
+        out_dir = self._config.output_dir / verdict_label / f"seed_{seed}"
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -646,7 +683,7 @@ class Reducer:
         self._collect_ir_dumps(seed, triton_src, metadata, compile_options, ir_dir)
 
         # ── Package into a zip ────────────────────────────────────────────
-        zip_path = self._config.output_dir / f"seed_{seed}_artifacts.zip"
+        zip_path = self._config.output_dir / verdict_label / f"seed_{seed}_artifacts.zip"
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for fp in out_dir.rglob("*"):

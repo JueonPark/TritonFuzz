@@ -66,6 +66,8 @@ class Fuzzer:
 
             if result.verdict in (Verdict.FAIL, Verdict.CRASH):
                 logger.warning("seed %d → %s: %s", seed, result.verdict.value, result.message)
+            elif result.verdict == Verdict.COMPILE_ERROR:
+                logger.debug("seed %d → %s: %s", seed, result.verdict.value, result.message)
             else:
                 logger.debug("seed %d → %s", seed, result.verdict.value)
 
@@ -98,6 +100,12 @@ class Fuzzer:
 
         compiled: CompilationResult = self._driver.compile(kernel)
         if not compiled.success:
+            # Save compile-error artifacts for later analysis
+            self._reducer.save_compile_error(
+                kernel,
+                error_message=str(compiled.error),
+                compile_options=compiled.compile_options,
+            )
             return VerificationResult(
                 seed=seed,
                 verdict=Verdict.COMPILE_ERROR,
@@ -138,6 +146,11 @@ class Fuzzer:
         sweep: SweepResult = self._driver.compile_sweep(kernel)
 
         if not sweep.any_succeeded:
+            # Save compile-error artifacts for later analysis
+            self._reducer.save_compile_error(
+                kernel,
+                error_message="All sweep variants failed to compile",
+            )
             return VerificationResult(
                 seed=seed,
                 verdict=Verdict.COMPILE_ERROR,

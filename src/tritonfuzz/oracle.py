@@ -91,6 +91,7 @@ class CampaignStats:
                 self.timed_out += 1
             case Verdict.COMPILE_ERROR:
                 self.compile_errors += 1
+                self.interesting_seeds.append(result.seed)
             case Verdict.NAN_MISMATCH:
                 self.nan_mismatches += 1
                 self.interesting_seeds.append(result.seed)

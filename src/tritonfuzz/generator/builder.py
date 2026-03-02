@@ -32,6 +32,8 @@ from tritonfuzz.generator.ops import (
 from tritonfuzz.generator.symbol_table import SymbolTable, TensorVar
 from tritonfuzz.generator.types import (
     CAST_TARGET_DTYPES,
+    BFLOAT16,
+    FLOAT16,
     FLOAT32,
     DType,
     pick_float_dtype,
@@ -39,13 +41,21 @@ from tritonfuzz.generator.types import (
     promote,
 )
 
-# ── Tunables ─────────────────────────────────────────────────────────────────
+# ── Tunables ─────────────────────────────────────────────────────────────
 
 BLOCK_SIZE_CHOICES: list[int] = [64, 128, 256, 512, 1024]
 N_ELEMENTS_CHOICES: list[int] = [512, 1024, 2048, 4096, 8192]
 
 # Accumulation operators used inside generated ``for`` loops.
 _LOOP_ACCUM_OPS: list[str] = ["+", "*", "-"]
+
+# ── Dot (tl.dot) tunables ────────────────────────────────────────────────
+
+_DOT_BLOCK_CHOICES: list[int] = [16, 32, 64]
+_DOT_DIM_CHOICES: list[int] = [64, 128, 256]
+_DOT_K_CHOICES: list[int] = [32, 64, 128]
+_DOT_INPUT_DTYPES: list[DType] = [FLOAT16, BFLOAT16, FLOAT32]
+_DOT_INPUT_WEIGHTS: list[float] = [3.0, 3.0, 1.0]
 
 
 class KernelBuilder:
@@ -78,6 +88,18 @@ class KernelBuilder:
         # ── Atomic store (replaces tl.store epilogue) ────────────────────
         self.use_atomic: bool = False
         self.atomic_op: Optional[AtomicOpTemplate] = None
+
+        # ── Dot product mode (tl.dot, matmul tile) ───────────────────
+        self.use_dot: bool = False
+        self.dot_M: int = 0
+        self.dot_N: int = 0
+        self.dot_K: int = 0
+        self.dot_BLOCK_M: int = 0
+        self.dot_BLOCK_N: int = 0
+        self.dot_BLOCK_K: int = 0
+        self.dot_post_ops: int = 0
+        self.dot_input_dtype: Optional[DType] = None
+        self._dot_acc_name: str = ""
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -148,6 +170,14 @@ class KernelBuilder:
         if self.use_atomic:
             self.atomic_op = pick_atomic_op(rng)
 
+        # Dot product kernel (10 %) — mutually exclusive with atomic
+        self.use_dot = rng.random() > 0.90
+        if self.use_dot:
+            self.use_atomic = False
+            self.atomic_op = None
+            self.insert_loop = False  # K-loop is built into dot template
+            self._plan_dot()
+
         # ── Apply extra_config overrides ─────────────────────────────────
         if "max_body_ops" in self._extra_config:
             self.num_body_ops = min(
@@ -159,11 +189,51 @@ class KernelBuilder:
                 self.num_inputs = cap
                 self.input_dtypes = self.input_dtypes[:cap]
 
+    def _plan_dot(self) -> None:
+        """Configure matrix dimensions and block sizes for a dot kernel."""
+        rng = self.rng
+
+        # Block sizes (must be >= 16 for tensor cores)
+        self.dot_BLOCK_M = rng.choice(_DOT_BLOCK_CHOICES)
+        self.dot_BLOCK_N = rng.choice(_DOT_BLOCK_CHOICES)
+        self.dot_BLOCK_K = rng.choice(_DOT_BLOCK_CHOICES)
+
+        # Matrix dimensions (must be multiples of block sizes)
+        m_choices = [d for d in _DOT_DIM_CHOICES if d >= self.dot_BLOCK_M]
+        n_choices = [d for d in _DOT_DIM_CHOICES if d >= self.dot_BLOCK_N]
+        k_choices = [d for d in _DOT_K_CHOICES if d >= self.dot_BLOCK_K]
+
+        self.dot_M = rng.choice(m_choices) if m_choices else self.dot_BLOCK_M
+        self.dot_N = rng.choice(n_choices) if n_choices else self.dot_BLOCK_N
+        self.dot_K = rng.choice(k_choices) if k_choices else self.dot_BLOCK_K
+
+        # Ensure exact divisibility
+        self.dot_M = (self.dot_M // self.dot_BLOCK_M) * self.dot_BLOCK_M
+        self.dot_N = (self.dot_N // self.dot_BLOCK_N) * self.dot_BLOCK_N
+        self.dot_K = (self.dot_K // self.dot_BLOCK_K) * self.dot_BLOCK_K
+
+        # Input dtype for both matrices (tl.dot requires matching types)
+        self.dot_input_dtype = rng.choices(
+            _DOT_INPUT_DTYPES, weights=_DOT_INPUT_WEIGHTS, k=1,
+        )[0]
+
+        # Number of element-wise post-ops on the dot result
+        self.dot_post_ops = rng.randint(0, 3)
+
+        # Override general planning for dot mode
+        self.num_inputs = 2
+        self.input_dtypes = [self.dot_input_dtype, self.dot_input_dtype]
+        self.num_body_ops = self.dot_post_ops
+        self.use_mask = False  # dimensions are aligned, no masking needed
+        self.n_elements = self.dot_M * self.dot_N  # total output elements
+
     # ================================================================== #
     #  Phase 2 – Emit loads (§4.2.1)                                       #
     # ================================================================== #
 
     def _emit_loads(self) -> None:
+        if self.use_dot:
+            return  # Dot loads are part of the K-loop in assembly
         for i in range(self.num_inputs):
             var_name = self.symtab.fresh_name("v")  # v_0, v_1, …
             dt = self.input_dtypes[i]
@@ -189,6 +259,10 @@ class KernelBuilder:
     # ================================================================== #
 
     def _emit_body(self) -> None:
+        if self.use_dot:
+            self._emit_dot_body()
+            return
+
         ops_emitted = 0
         loop_inserted = False
 
@@ -206,6 +280,18 @@ class KernelBuilder:
 
             self._emit_one_op()
             ops_emitted += 1
+
+    def _emit_dot_body(self) -> None:
+        """Register the dot accumulator and emit optional post-ops."""
+        acc_name = self.symtab.fresh_name("v")
+        dot_shape = ("BLOCK_M", "BLOCK_N")
+        self.symtab.add(TensorVar(acc_name, FLOAT32, is_block=True, shape=dot_shape))
+        self._dot_acc_name = acc_name
+        self._ops_used.append("dot")
+
+        # Emit optional element-wise post-ops on the accumulator
+        for _ in range(self.dot_post_ops):
+            self._emit_one_op()
 
     # ── Single-op dispatcher ─────────────────────────────────────────────
 
@@ -255,7 +341,7 @@ class KernelBuilder:
         self._triton_body.append(f"{indent}{out_name} = {op.triton_fmt.format(inp.name)}")
         self._torch_body.append(f"{indent}{out_name} = {op.torch_fmt.format(inp.name)}")
 
-        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True))
+        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True, shape=inp.shape))
         self._ops_used.append(op.name)
 
     # ── Binary op emission ───────────────────────────────────────────────
@@ -275,7 +361,7 @@ class KernelBuilder:
         )
 
         out_dt = promote(a.dtype, b.dtype) if op.output_dtype_rule == "promote" else a.dtype
-        self.symtab.add(TensorVar(out_name, out_dt, is_block=True))
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=a.shape))
         self._ops_used.append(op.name)
 
     # ── ``tl.where`` emission (§4.2.2 Logic) ────────────────────────────
@@ -306,7 +392,7 @@ class KernelBuilder:
         )
 
         out_dt = promote(true_var.dtype, false_var.dtype)
-        self.symtab.add(TensorVar(out_name, out_dt, is_block=True))
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=true_var.shape))
         self._ops_used.append("where")
 
     # ── Explicit type-cast emission (§4.2.3) ─────────────────────────────
@@ -332,7 +418,7 @@ class KernelBuilder:
         self._triton_body.append(f"{indent}{out_name} = {src.name}.to({target_dtype.triton})")
         self._torch_body.append(f"{indent}{out_name} = {src.name}.to({target_dtype.torch})")
 
-        self.symtab.add(TensorVar(out_name, target_dtype, is_block=True))
+        self.symtab.add(TensorVar(out_name, target_dtype, is_block=True, shape=src.shape))
         self._ops_used.append(f"cast_to_{target_dtype.short}")
 
     # ── For-loop emission (§4.3 Control Flow) ────────────────────────────
@@ -376,7 +462,7 @@ class KernelBuilder:
         )
 
         out_dt = promote(src.dtype, operand.dtype)
-        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True))
+        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
         self._ops_used.append(f"loop_{accum_op}")
 
     # ================================================================== #
@@ -391,6 +477,9 @@ class KernelBuilder:
     # ================================================================== #
 
     def _assemble_triton_source(self) -> str:
+        if self.use_dot:
+            return self._assemble_dot_triton_source()
+
         seed = self.seed
         ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
         out_var = self._output_var.name if self._output_var else "v_0"
@@ -431,7 +520,56 @@ class KernelBuilder:
 
         return "\n".join(lines) + "\n"
 
+    def _assemble_dot_triton_source(self) -> str:
+        """Assemble a matmul-tile kernel using ``tl.dot``."""
+        seed = self.seed
+        acc = self._dot_acc_name
+        out_var = self._output_var.name if self._output_var else acc
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            "    a_ptr, b_ptr, out_ptr,",
+            "    M, N, K,",
+            "    stride_am, stride_ak,",
+            "    stride_bk, stride_bn,",
+            "    stride_cm, stride_cn,",
+            "    BLOCK_M: tl.constexpr,",
+            "    BLOCK_N: tl.constexpr,",
+            "    BLOCK_K: tl.constexpr,",
+            "):",
+            "    pid_m = tl.program_id(0)",
+            "    pid_n = tl.program_id(1)",
+            "    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)",
+            "    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)",
+            f"    {acc} = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)",
+            "    for k_start in range(0, K, BLOCK_K):",
+            "        offs_k = k_start + tl.arange(0, BLOCK_K)",
+            "        a = tl.load(a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)",
+            "        b = tl.load(b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)",
+            f"        {acc} += tl.dot(a, b)",
+        ]
+
+        # Post-ops from body
+        for line in self._triton_body:
+            lines.append(f"    {line}")
+
+        # Store
+        lines.extend([
+            "    c_ptrs = out_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn",
+            f"    tl.store(c_ptrs, {out_var})",
+        ])
+
+        return "\n".join(lines) + "\n"
+
     def _assemble_torch_ref_source(self) -> str:
+        if self.use_dot:
+            return self._assemble_dot_torch_ref_source()
+
         seed = self.seed
         input_args = ", ".join(f"x{i}" for i in range(self.num_inputs))
         out_var = self._output_var.name if self._output_var else "v_0"
@@ -450,13 +588,34 @@ class KernelBuilder:
 
         return "\n".join(lines) + "\n"
 
+    def _assemble_dot_torch_ref_source(self) -> str:
+        """Assemble the PyTorch reference for a dot kernel."""
+        seed = self.seed
+        acc = self._dot_acc_name
+        out_var = self._output_var.name if self._output_var else acc
+
+        lines: list[str] = [
+            "import torch",
+            "",
+            "",
+            f"def torch_ref_seed_{seed}(a, b):",
+            f"    {acc} = torch.matmul(a.float(), b.float())",
+        ]
+
+        for line in self._torch_body:
+            lines.append(f"    {line}")
+
+        lines.append(f"    return {out_var}")
+
+        return "\n".join(lines) + "\n"
+
     # ================================================================== #
     #  Metadata                                                            #
     # ================================================================== #
 
     def _build_metadata(self) -> dict:
         meta = {
-            "generator_version": "0.2.0",
+            "generator_version": "0.3.0",
             "seed": self.seed,
             "num_inputs": self.num_inputs,
             "input_dtypes": [d.torch for d in self.input_dtypes],
@@ -475,10 +634,24 @@ class KernelBuilder:
             "loop_trip_count": self.loop_trip_count,
             "mix_dtypes": self.mix_dtypes,
             "has_atomics": self.use_atomic,
+            "use_dot": self.use_dot,
         }
         if self.use_atomic and self.atomic_op is not None:
             meta["atomic_op"] = self.atomic_op.name
             meta["output_init"] = self.atomic_op.output_init
             self._ops_used.append(self.atomic_op.name)
             meta["ops_used"] = list(self._ops_used)
+        if self.use_dot:
+            meta["dot_M"] = self.dot_M
+            meta["dot_N"] = self.dot_N
+            meta["dot_K"] = self.dot_K
+            meta["dot_BLOCK_M"] = self.dot_BLOCK_M
+            meta["dot_BLOCK_N"] = self.dot_BLOCK_N
+            meta["dot_BLOCK_K"] = self.dot_BLOCK_K
+            meta["input_shapes"] = [
+                [self.dot_M, self.dot_K],
+                [self.dot_K, self.dot_N],
+            ]
+            meta["output_shape"] = [self.dot_M, self.dot_N]
+            meta["output_dtype"] = "torch.float32"  # dot accumulator is always fp32
         return meta

@@ -142,6 +142,9 @@ class Runtime:
         produced by the Generator.
         """
         meta = kernel.metadata
+        if meta.get("use_dot"):
+            return self._allocate_dot_inputs(kernel)
+
         n_elements = meta.get("n_elements", 1024)
         num_inputs = meta.get("num_inputs", 1)
         dtype_strs: list[str] = meta.get("input_dtypes", ["torch.float32"] * num_inputs)
@@ -163,6 +166,19 @@ class Runtime:
             tensors.append(t)
 
         return tensors
+
+    def _allocate_dot_inputs(self, kernel: GeneratedKernel) -> list[torch.Tensor]:
+        """Allocate 2D matrix inputs for a dot-product kernel."""
+        meta = kernel.metadata
+        M = meta["dot_M"]
+        N = meta["dot_N"]
+        K = meta["dot_K"]
+        dt_str = meta["input_dtypes"][0]
+        dt = _TORCH_DTYPE_MAP.get(dt_str, torch.float32)
+
+        A = torch.randn(M, K, device=self._device, dtype=dt)
+        B = torch.randn(K, N, device=self._device, dtype=dt)
+        return [A, B]
 
     def _run_torch_ref(
         self,
@@ -192,12 +208,11 @@ class Runtime:
         compiled: CompilationResult,
         inputs: list[torch.Tensor],
     ) -> torch.Tensor:
-        """Launch the compiled Triton kernel and return its output.
-
-        Dynamically imports and calls the ``@triton.jit`` kernel using the
-        standard Triton grid-launch syntax.
-        """
+        """Launch the compiled Triton kernel and return its output."""
         meta = kernel.metadata
+        if meta.get("use_dot"):
+            return self._run_dot_triton_kernel(kernel, compiled, inputs)
+
         n_elements = meta.get("n_elements", 1024)
         block_size = meta.get("block_size", 256)
         output_dtype_str = meta.get("output_dtype", "torch.float32")
@@ -230,6 +245,41 @@ class Runtime:
 
         grid = ((n_elements + block_size - 1) // block_size,)
         jit_fn[grid](*inputs, out, n_elements, BLOCK_SIZE=block_size)
+
+        return out
+
+    def _run_dot_triton_kernel(
+        self,
+        kernel: GeneratedKernel,
+        compiled: CompilationResult,
+        inputs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Launch a dot-product kernel with 2D grid and stride args."""
+        meta = kernel.metadata
+        M = meta["dot_M"]
+        N = meta["dot_N"]
+        K = meta["dot_K"]
+        BLOCK_M = meta["dot_BLOCK_M"]
+        BLOCK_N = meta["dot_BLOCK_N"]
+        BLOCK_K = meta["dot_BLOCK_K"]
+
+        output_dtype_str = meta.get("output_dtype", "torch.float32")
+        output_dtype = _TORCH_DTYPE_MAP.get(output_dtype_str, torch.float32)
+
+        A, B = inputs[0], inputs[1]
+        out = torch.empty(M, N, device=self._device, dtype=output_dtype)
+
+        jit_fn = self._load_jit_fn_from_source(kernel)
+
+        grid = (M // BLOCK_M, N // BLOCK_N)
+        jit_fn[grid](
+            A, B, out,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
 
         return out
 

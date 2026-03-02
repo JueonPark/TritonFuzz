@@ -22,6 +22,7 @@ class TensorVar:
     name: str
     dtype: DType
     is_block: bool = True  # True → BLOCK_SIZE-shaped; False → scalar
+    shape: tuple[str, ...] = ()  # e.g. ("BLOCK_SIZE",) for 1D, ("BLOCK_M","BLOCK_N") for 2D; () = default 1D
 
 
 class SymbolTable:
@@ -68,11 +69,14 @@ class SymbolTable:
         *,
         is_block: bool = True,
         require_float: bool = False,
+        shape: Optional[tuple[str, ...]] = None,
     ) -> Optional[TensorVar]:
         """Pick a random variable matching the filters, or ``None``."""
         candidates = [v for v in self.all_vars() if v.is_block == is_block]
         if require_float:
             candidates = [v for v in candidates if v.dtype.is_float]
+        if shape is not None:
+            candidates = [v for v in candidates if v.shape == shape]
         return rng.choice(candidates) if candidates else None
 
     def pick_two(
@@ -81,16 +85,19 @@ class SymbolTable:
         *,
         is_block: bool = True,
         prefer_same_dtype: bool = False,
+        shape: Optional[tuple[str, ...]] = None,
     ) -> tuple[Optional[TensorVar], Optional[TensorVar]]:
         """Pick two (possibly identical) variables for binary ops."""
-        a = self.pick_random(rng, is_block=is_block)
+        a = self.pick_random(rng, is_block=is_block, shape=shape)
         if a is None:
             return None, None
         if prefer_same_dtype:
             same = [v for v in self.all_vars() if v.is_block == is_block and v.dtype == a.dtype]
-            b = rng.choice(same) if same else self.pick_random(rng, is_block=is_block)
+            if shape is not None:
+                same = [v for v in same if v.shape == shape]
+            b = rng.choice(same) if same else self.pick_random(rng, is_block=is_block, shape=shape)
         else:
-            b = self.pick_random(rng, is_block=is_block)
+            b = self.pick_random(rng, is_block=is_block, shape=shape)
         return a, b
 
     def last_var(self) -> Optional[TensorVar]:

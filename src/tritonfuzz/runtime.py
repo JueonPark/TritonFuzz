@@ -203,7 +203,25 @@ class Runtime:
         output_dtype_str = meta.get("output_dtype", "torch.float32")
         output_dtype = _TORCH_DTYPE_MAP.get(output_dtype_str, torch.float32)
 
-        out = torch.empty(n_elements, device=self._device, dtype=output_dtype)
+        # Initialise output tensor — atomic ops require specific init values
+        # so that the first write is an identity (non-overlapping pattern).
+        output_init = meta.get("output_init", "empty")
+        if output_init == "zeros":
+            out = torch.zeros(n_elements, device=self._device, dtype=output_dtype)
+        elif output_init == "neg_inf":
+            if output_dtype.is_floating_point:
+                fill = float("-inf")
+            else:
+                fill = torch.iinfo(output_dtype).min
+            out = torch.full((n_elements,), fill, device=self._device, dtype=output_dtype)
+        elif output_init == "pos_inf":
+            if output_dtype.is_floating_point:
+                fill = float("inf")
+            else:
+                fill = torch.iinfo(output_dtype).max
+            out = torch.full((n_elements,), fill, device=self._device, dtype=output_dtype)
+        else:
+            out = torch.empty(n_elements, device=self._device, dtype=output_dtype)
 
         # The compiled kernel needs to be launched via the JIT function.
         # Write source to a temp file and import it — Triton requires @jit

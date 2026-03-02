@@ -122,6 +122,12 @@ class KernelBuilder:
         self._emit_body()
         self._choose_output()
 
+        # Reductions (tl.sum/max/min) compute per-block aggregates.
+        # To match the PyTorch reference (which reduces globally), we
+        # force single-block execution so that the block IS the full tensor.
+        if any(op.startswith("reduce_") for op in self._ops_used) and not self.use_dot:
+            self.n_elements = self.block_size
+
         triton_src = self._assemble_triton_source()
         torch_src = self._assemble_torch_ref_source()
         metadata = self._build_metadata()

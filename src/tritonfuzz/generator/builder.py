@@ -22,8 +22,10 @@ from tritonfuzz.generator.ops import (
     BINARY_OPS,
     COMPARISON_OPS,
     COMPARISON_THRESHOLDS,
+    AtomicOpTemplate,
     OpCategory,
     OpTemplate,
+    pick_atomic_op,
     pick_category,
     pick_op_from_category,
 )
@@ -72,6 +74,10 @@ class KernelBuilder:
         self.insert_loop: bool = False
         self.loop_trip_count: int = 1
         self.mix_dtypes: bool = False
+
+        # ── Atomic store (replaces tl.store epilogue) ────────────────────
+        self.use_atomic: bool = False
+        self.atomic_op: Optional[AtomicOpTemplate] = None
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -136,6 +142,11 @@ class KernelBuilder:
                 idx = rng.randint(0, self.num_inputs - 1)
                 self.input_dtypes[idx] = pick_input_dtype(rng)
                 attempts += 1
+
+        # Atomic store: replace tl.store with an atomic op (15 %)
+        self.use_atomic = rng.random() > 0.85
+        if self.use_atomic:
+            self.atomic_op = pick_atomic_op(rng)
 
         # ── Apply extra_config overrides ─────────────────────────────────
         if "max_body_ops" in self._extra_config:
@@ -409,8 +420,14 @@ class KernelBuilder:
             lines.append(f"    {line}")
 
         # ── Standard epilogue (§4.1.1) ───────────────────────────────────
-        mask_arg = ", mask=mask" if self.use_mask else ""
-        lines.append(f"    tl.store(out_ptr + offsets, {out_var}{mask_arg})")
+        if self.use_atomic and self.atomic_op is not None:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(
+                f"    {self.atomic_op.triton_fn}(out_ptr + offsets, {out_var}{mask_arg})"
+            )
+        else:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(f"    tl.store(out_ptr + offsets, {out_var}{mask_arg})")
 
         return "\n".join(lines) + "\n"
 
@@ -438,8 +455,8 @@ class KernelBuilder:
     # ================================================================== #
 
     def _build_metadata(self) -> dict:
-        return {
-            "generator_version": "0.1.0",
+        meta = {
+            "generator_version": "0.2.0",
             "seed": self.seed,
             "num_inputs": self.num_inputs,
             "input_dtypes": [d.torch for d in self.input_dtypes],
@@ -457,4 +474,11 @@ class KernelBuilder:
             "has_loop": self.insert_loop,
             "loop_trip_count": self.loop_trip_count,
             "mix_dtypes": self.mix_dtypes,
+            "has_atomics": self.use_atomic,
         }
+        if self.use_atomic and self.atomic_op is not None:
+            meta["atomic_op"] = self.atomic_op.name
+            meta["output_init"] = self.atomic_op.output_init
+            self._ops_used.append(self.atomic_op.name)
+            meta["ops_used"] = list(self._ops_used)
+        return meta

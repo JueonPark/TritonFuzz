@@ -36,11 +36,11 @@ class OpCategory(str, Enum):
     ELEMENTWISE_BINARY = "elementwise_binary"
     LOGIC              = "logic"
     TYPE_CAST          = "type_cast"
+    ATOMIC             = "atomic"
 
     # Future stubs
     REDUCTION    = "reduction"
     DOT          = "dot"
-    ATOMIC       = "atomic"
     POINTER_MATH = "pointer_math"
 
 
@@ -106,6 +106,40 @@ LOGIC_BINARY_OPS: list[OpTemplate] = [
     OpTemplate("maximum", OpCategory.LOGIC, 2,
                "tl.maximum({0}, {1})", "torch.maximum({0}, {1})", "promote", 2.0),
 ]
+
+
+# ── Atomic store operations (replace epilogue ``tl.store``) ──────────────────
+
+
+@dataclass(frozen=True)
+class AtomicOpTemplate:
+    """Describes an atomic operation that replaces the store epilogue.
+
+    Unlike regular ``OpTemplate``s which produce body statements, atomics
+    change the *store* at the end of the kernel.  The ``output_init``
+    field tells the runtime how to initialise the output tensor so that
+    the atomic is an identity w.r.t. the first write (non-overlapping
+    pattern).
+    """
+
+    name: str                # e.g. "atomic_add"
+    triton_fn: str           # e.g. "tl.atomic_add"
+    output_init: str         # "zeros" | "neg_inf" | "pos_inf" | "empty"
+    weight: float = 1.0
+
+
+ATOMIC_OPS: list[AtomicOpTemplate] = [
+    AtomicOpTemplate("atomic_add",  "tl.atomic_add",  "zeros",   3.0),
+    AtomicOpTemplate("atomic_max",  "tl.atomic_max",  "neg_inf", 2.0),
+    AtomicOpTemplate("atomic_min",  "tl.atomic_min",  "pos_inf", 2.0),
+    AtomicOpTemplate("atomic_xchg", "tl.atomic_xchg", "empty",   1.0),
+]
+
+
+def pick_atomic_op(rng: random.Random) -> AtomicOpTemplate:
+    """Weighted random selection of an atomic store operation."""
+    weights = [op.weight for op in ATOMIC_OPS]
+    return rng.choices(ATOMIC_OPS, weights=weights, k=1)[0]
 
 # ── Convenience aggregates ───────────────────────────────────────────────────
 

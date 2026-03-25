@@ -120,6 +120,13 @@ _OP_TOLERANCE_MULTIPLIERS: dict[str, float] = {
     "reduce_sum": 2.0,
     "reduce_max": 1.5,
     "reduce_min": 1.5,
+    # Divergent control flow – while loops accumulate FP error
+    "while_loop":      2.0,
+    "loop_with_branch": 2.0,
+    "while_in_if":     2.0,
+    # If/else and nested-if do not add numerical error themselves
+    "if_else":         1.0,
+    "nested_if_in_if": 1.0,
 }
 
 # Output dtype → base tolerance override.

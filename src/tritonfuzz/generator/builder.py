@@ -50,6 +50,28 @@ N_ELEMENTS_CHOICES: list[int] = [512, 1024, 2048, 4096, 8192]
 # Accumulation operators used inside generated ``for`` loops.
 _LOOP_ACCUM_OPS: list[str] = ["+", "*", "-"]
 
+# ── Scalar-condition tunables (for if/else and while) ────────────────────
+
+# Reduction functions used to derive scalar conditions from block tensors.
+_COND_REDUCTION_TRITON: list[str] = [
+    "tl.sum({0}, axis=0)",
+    "tl.max({0}, axis=0)",
+    "tl.min({0}, axis=0)",
+]
+_COND_REDUCTION_TORCH: list[str] = [
+    "torch.sum({0})",
+    "torch.max({0})",
+    "torch.min({0})",
+]
+_COND_THRESHOLDS: list[str] = ["0.0", "0.5", "1.0", "-0.5", "-1.0"]
+_COND_COMPARISONS: list[str] = [">", "<", ">=", "<="]
+
+# Maximum iteration counts for bounded while-loops.
+_WHILE_MAX_ITER_CHOICES: list[int] = [4, 8, 16]
+
+# ── Nested control-flow patterns ─────────────────────────────────────────
+_NESTED_CF_PATTERNS: list[str] = ["if_in_if", "if_in_while", "while_in_if"]
+
 # ── Dot (tl.dot) tunables ────────────────────────────────────────────────
 
 _DOT_BLOCK_CHOICES: list[int] = [16, 32, 64]
@@ -90,6 +112,14 @@ class KernelBuilder:
         self.use_atomic: bool = False
         self.atomic_op: Optional[AtomicOpTemplate] = None
 
+        # ── Divergent control flow (if/else, while, nested) ────────
+        self.insert_if_else: bool = False
+        self.if_else_branch_ops: int = 1
+        self.insert_while_loop: bool = False
+        self.while_max_iter: int = 4
+        self.insert_nested_cf: bool = False
+        self.nested_cf_pattern: str = ""
+
         # ── Dot product mode (tl.dot, matmul tile) ───────────────────
         self.use_dot: bool = False
         self.dot_M: int = 0
@@ -125,7 +155,14 @@ class KernelBuilder:
         # Reductions (tl.sum/max/min) compute per-block aggregates.
         # To match the PyTorch reference (which reduces globally), we
         # force single-block execution so that the block IS the full tensor.
-        if any(op.startswith("reduce_") for op in self._ops_used) and not self.use_dot:
+        # This also applies to control-flow constructs whose conditions
+        # use reductions (if/else, while, nested CF).
+        has_reduction_cf = any(
+            op in self._ops_used
+            for op in ("if_else", "while_loop", "nested_if_in_if",
+                        "loop_with_branch", "while_in_if")
+        )
+        if (any(op.startswith("reduce_") for op in self._ops_used) or has_reduction_cf) and not self.use_dot:
             self.n_elements = self.block_size
 
         triton_src = self._assemble_triton_source()
@@ -184,6 +221,25 @@ class KernelBuilder:
             self.atomic_op = None
             self.insert_loop = False  # K-loop is built into dot template
             self._plan_dot()
+
+        # ── Divergent control flow (not in dot mode) ─────────────────
+        if not self.use_dot:
+            # Nested control flow (10 %) — subsumes if/else and while
+            self.insert_nested_cf = rng.random() > 0.90
+            if self.insert_nested_cf:
+                self.nested_cf_pattern = rng.choice(_NESTED_CF_PATTERNS)
+                self.if_else_branch_ops = rng.randint(1, 3)
+                self.while_max_iter = rng.choice(_WHILE_MAX_ITER_CHOICES)
+            else:
+                # If/else branches (25 %)
+                self.insert_if_else = rng.random() > 0.75
+                if self.insert_if_else:
+                    self.if_else_branch_ops = rng.randint(1, 3)
+
+                # Data-dependent while loop (20 %)
+                self.insert_while_loop = rng.random() > 0.80
+                if self.insert_while_loop:
+                    self.while_max_iter = rng.choice(_WHILE_MAX_ITER_CHOICES)
 
         # ── Apply extra_config overrides ─────────────────────────────────
         if "max_body_ops" in self._extra_config:
@@ -272,8 +328,46 @@ class KernelBuilder:
 
         ops_emitted = 0
         loop_inserted = False
+        if_else_inserted = False
+        while_inserted = False
+        nested_cf_inserted = False
 
         while ops_emitted < self.num_body_ops:
+            # Insert nested control flow roughly at 1/3 of body.
+            if (
+                self.insert_nested_cf
+                and not nested_cf_inserted
+                and ops_emitted >= self.num_body_ops // 3
+            ):
+                self._emit_nested_cf()
+                nested_cf_inserted = True
+                ops_emitted += 1
+                continue
+
+            # Insert if/else roughly at 1/3 of body.
+            if (
+                self.insert_if_else
+                and not if_else_inserted
+                and not self.insert_nested_cf
+                and ops_emitted >= self.num_body_ops // 3
+            ):
+                self._emit_if_else()
+                if_else_inserted = True
+                ops_emitted += 1
+                continue
+
+            # Insert while-loop roughly at 2/3 of body.
+            if (
+                self.insert_while_loop
+                and not while_inserted
+                and not self.insert_nested_cf
+                and ops_emitted >= (self.num_body_ops * 2) // 3
+            ):
+                self._emit_while_loop()
+                while_inserted = True
+                ops_emitted += 1
+                continue
+
             # Insert the for-loop roughly in the middle of the body.
             if (
                 self.insert_loop
@@ -531,6 +625,498 @@ class KernelBuilder:
         self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
         self._ops_used.append(f"loop_{accum_op}")
 
+    # ── Scalar condition helpers (for if/else and while) ─────────────────
+
+    def _make_scalar_condition(self) -> tuple[str, str]:
+        """Build a scalar boolean condition from a reduction of a block var.
+
+        Returns ``(triton_cond_expr, torch_cond_expr)`` suitable for use
+        in ``if`` / ``while`` headers.  The condition reduces a block
+        tensor to a scalar via ``tl.sum`` / ``tl.max`` / ``tl.min`` and
+        compares it against a constant threshold.
+        """
+        rng = self.rng
+        cond_var = self.symtab.pick_random(rng, is_block=True, shape=())
+        if cond_var is None:
+            # Fallback: always-true to keep generation going
+            return "True", "True"
+
+        idx = rng.randint(0, len(_COND_REDUCTION_TRITON) - 1)
+        triton_red = _COND_REDUCTION_TRITON[idx].format(cond_var.name)
+        torch_red = _COND_REDUCTION_TORCH[idx].format(cond_var.name)
+
+        cmp = rng.choice(_COND_COMPARISONS)
+        threshold = rng.choice(_COND_THRESHOLDS)
+
+        triton_cond = f"{triton_red} {cmp} {threshold}"
+        torch_cond = f"{torch_red} {cmp} {threshold}"
+        return triton_cond, torch_cond
+
+    # ── If/else branch emission (divergent control flow) ─────────────────
+
+    def _emit_if_else(self, indent: str = "") -> None:
+        """Emit an ``if``/``else`` block where each branch performs
+        different tensor operations, forcing the LLVM backend to handle
+        CFG reconvergence and divergent register allocation.
+
+        Pattern::
+
+            _cond = tl.sum(v_M, axis=0) > 0.5
+            if _cond:
+                v_N = tl.exp(v_A)
+            else:
+                v_N = tl.sin(v_B)
+
+        Both branches write to the **same output variable** so the
+        post-branch symbol table stays consistent.
+        """
+        rng = self.rng
+        triton_cond, torch_cond = self._make_scalar_condition()
+
+        # Pre-allocate the output name that both branches must define.
+        out_name = self.symtab.fresh_name("v")
+        inner = indent + "    "
+
+        # Snapshot before branching so both sides see the same operands.
+        snap = self.symtab.snapshot()
+
+        # ── IF header ────────────────────────────────────────────────
+        self._triton_body.append(f"{indent}if {triton_cond}:")
+        self._torch_body.append(f"{indent}if {torch_cond}:")
+
+        # ── True branch ──────────────────────────────────────────────
+        true_triton_start = len(self._triton_body)
+        true_torch_start = len(self._torch_body)
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent=inner)
+        true_last = self.symtab.last_var()
+
+        # Assign to unified output
+        if true_last is not None:
+            self._triton_body.append(f"{inner}{out_name} = {true_last.name}")
+            self._torch_body.append(f"{inner}{out_name} = {true_last.name}")
+            true_dtype = true_last.dtype
+            true_shape = true_last.shape
+        else:
+            # Branch produced nothing — fallback to an existing var
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"{inner}{out_name} = {fb_name}")
+            self._torch_body.append(f"{inner}{out_name} = {fb_name}")
+            true_dtype = fb.dtype if fb else FLOAT32
+            true_shape = fb.shape if fb else ()
+
+        # ── Restore for false branch ─────────────────────────────────
+        self.symtab.restore(snap)
+
+        # ── ELSE header ──────────────────────────────────────────────
+        self._triton_body.append(f"{indent}else:")
+        self._torch_body.append(f"{indent}else:")
+
+        # ── False branch ─────────────────────────────────────────────
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent=inner)
+        false_last = self.symtab.last_var()
+
+        if false_last is not None:
+            self._triton_body.append(f"{inner}{out_name} = {false_last.name}")
+            self._torch_body.append(f"{inner}{out_name} = {false_last.name}")
+            false_dtype = false_last.dtype
+            false_shape = false_last.shape
+        else:
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"{inner}{out_name} = {fb_name}")
+            self._torch_body.append(f"{inner}{out_name} = {fb_name}")
+            false_dtype = fb.dtype if fb else FLOAT32
+            false_shape = fb.shape if fb else ()
+
+        # ── Restore and register unified output ──────────────────────
+        self.symtab.restore(snap)
+        out_dt = promote(true_dtype, false_dtype)
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=true_shape))
+        self._ops_used.append("if_else")
+
+    # ── While-loop emission (data-dependent bounded iteration) ───────────
+
+    def _emit_while_loop(self, indent: str = "") -> None:
+        """Emit a data-dependent ``while``-loop with a mandatory counter
+        guard to prevent infinite iteration.
+
+        Pattern::
+
+            v_N = <source>
+            _while_i = 0
+            while tl.max(v_N, axis=0) < 10.0 and _while_i < MAX_ITER:
+                v_N = v_N <op> <operand>
+                _while_i += 1
+
+        The data-dependent condition (reduction comparison) forces the
+        Triton → MLIR → LLVM pipeline to handle ``scf.while`` lowering,
+        while the counter guard keeps execution bounded.
+        """
+        rng = self.rng
+        src = self.symtab.pick_random(rng, is_block=True, shape=())
+        operand = self.symtab.pick_random(rng, is_block=True, shape=())
+        if src is None or operand is None:
+            return
+
+        acc_name = self.symtab.fresh_name("v")
+        counter_name = f"_while_i_{self.symtab._counter}"
+        accum_op = rng.choice(_LOOP_ACCUM_OPS)
+        max_iter = self.while_max_iter
+
+        # Build the data-dependent condition
+        idx = rng.randint(0, len(_COND_REDUCTION_TRITON) - 1)
+        triton_red = _COND_REDUCTION_TRITON[idx]
+        torch_red = _COND_REDUCTION_TORCH[idx]
+        cmp = rng.choice(_COND_COMPARISONS)
+        threshold = rng.choice(["2.0", "5.0", "10.0", "20.0"])
+
+        inner = indent + "    "
+
+        # Initialise accumulator and counter
+        self._triton_body.append(f"{indent}{acc_name} = {src.name}")
+        self._torch_body.append(f"{indent}{acc_name} = {src.name}")
+        self._triton_body.append(f"{indent}{counter_name} = 0")
+        self._torch_body.append(f"{indent}{counter_name} = 0")
+
+        # While header with data-dependent + counter condition
+        triton_cond = f"{triton_red.format(acc_name)} {cmp} {threshold} and {counter_name} < {max_iter}"
+        torch_cond = f"{torch_red.format(acc_name)} {cmp} {threshold} and {counter_name} < {max_iter}"
+        self._triton_body.append(f"{indent}while {triton_cond}:")
+        self._torch_body.append(f"{indent}while {torch_cond}:")
+
+        # Loop body: accumulation + counter increment
+        self._triton_body.append(
+            f"{inner}{acc_name} = {acc_name} {accum_op} {operand.name}"
+        )
+        self._torch_body.append(
+            f"{inner}{acc_name} = {acc_name} {accum_op} {operand.name}"
+        )
+        self._triton_body.append(f"{inner}{counter_name} += 1")
+        self._torch_body.append(f"{inner}{counter_name} += 1")
+
+        out_dt = promote(src.dtype, operand.dtype)
+        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
+        self._ops_used.append("while_loop")
+
+    # ── Nested control-flow emission ─────────────────────────────────────
+
+    def _emit_nested_cf(self) -> None:
+        """Emit nested control-flow according to ``self.nested_cf_pattern``.
+
+        Supported patterns:
+
+        * ``if_in_if``    – outer if/else where one branch contains an
+                            inner if/else (depth-2 branching, stresses
+                            reconvergence tracking).
+        * ``if_in_while`` – while-loop whose body contains an if/else
+                            (loop→branch nesting, stresses register
+                            allocation across iterations with divergent
+                            paths).
+        * ``while_in_if`` – outer if/else where one branch contains a
+                            while-loop (branch→loop nesting, stresses
+                            shared-memory synchronisation).
+        """
+        pattern = self.nested_cf_pattern
+        if pattern == "if_in_if":
+            self._emit_nested_if_in_if()
+        elif pattern == "if_in_while":
+            self._emit_loop_with_branch()
+        elif pattern == "while_in_if":
+            self._emit_while_in_if()
+        else:
+            # Fallback: simple if/else
+            self._emit_if_else()
+
+    def _emit_nested_if_in_if(self) -> None:
+        """Outer if/else where the true branch contains an inner if/else.
+
+        Pattern::
+
+            if <cond_outer>:
+                if <cond_inner>:
+                    v_N = <op_a>(v_X)
+                else:
+                    v_N = <op_b>(v_X)
+            else:
+                v_N = <op_c>(v_X)
+        """
+        rng = self.rng
+        triton_cond_outer, torch_cond_outer = self._make_scalar_condition()
+        out_name = self.symtab.fresh_name("v")
+        snap = self.symtab.snapshot()
+
+        # ── Outer IF ─────────────────────────────────────────────────
+        self._triton_body.append(f"if {triton_cond_outer}:")
+        self._torch_body.append(f"if {torch_cond_outer}:")
+
+        # Inner if/else inside the true branch (indent = 4 spaces)
+        triton_cond_inner, torch_cond_inner = self._make_scalar_condition()
+        inner_snap = self.symtab.snapshot()
+
+        self._triton_body.append(f"    if {triton_cond_inner}:")
+        self._torch_body.append(f"    if {torch_cond_inner}:")
+
+        # Inner true branch (indent = 8 spaces)
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent="        ")
+        inner_true_last = self.symtab.last_var()
+        if inner_true_last is not None:
+            self._triton_body.append(f"        {out_name} = {inner_true_last.name}")
+            self._torch_body.append(f"        {out_name} = {inner_true_last.name}")
+            inner_true_dtype = inner_true_last.dtype
+        else:
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"        {out_name} = {fb_name}")
+            self._torch_body.append(f"        {out_name} = {fb_name}")
+            inner_true_dtype = fb.dtype if fb else FLOAT32
+
+        # Restore for inner else
+        self.symtab.restore(inner_snap)
+
+        self._triton_body.append("    else:")
+        self._torch_body.append("    else:")
+
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent="        ")
+        inner_false_last = self.symtab.last_var()
+        if inner_false_last is not None:
+            self._triton_body.append(f"        {out_name} = {inner_false_last.name}")
+            self._torch_body.append(f"        {out_name} = {inner_false_last.name}")
+            inner_false_dtype = inner_false_last.dtype
+        else:
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"        {out_name} = {fb_name}")
+            self._torch_body.append(f"        {out_name} = {fb_name}")
+            inner_false_dtype = fb.dtype if fb else FLOAT32
+
+        # ── Outer ELSE ───────────────────────────────────────────────
+        self.symtab.restore(snap)
+
+        self._triton_body.append("else:")
+        self._torch_body.append("else:")
+
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent="    ")
+        outer_false_last = self.symtab.last_var()
+        if outer_false_last is not None:
+            self._triton_body.append(f"    {out_name} = {outer_false_last.name}")
+            self._torch_body.append(f"    {out_name} = {outer_false_last.name}")
+            outer_false_dtype = outer_false_last.dtype
+        else:
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"    {out_name} = {fb_name}")
+            self._torch_body.append(f"    {out_name} = {fb_name}")
+            outer_false_dtype = fb.dtype if fb else FLOAT32
+
+        # ── Register unified output ──────────────────────────────────
+        self.symtab.restore(snap)
+        out_dt = promote(promote(inner_true_dtype, inner_false_dtype), outer_false_dtype)
+        src_for_shape = self.symtab.pick_random(rng, is_block=True, shape=())
+        shape = src_for_shape.shape if src_for_shape else ()
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=shape))
+        self._ops_used.append("nested_if_in_if")
+
+    def _emit_loop_with_branch(self) -> None:
+        """Emit a while-loop whose body contains an if/else branch.
+
+        Pattern::
+
+            v_N = <source>
+            _while_i = 0
+            while <data_cond> and _while_i < MAX_ITER:
+                if <inner_cond>:
+                    v_N = v_N + v_op1
+                else:
+                    v_N = v_N * v_op2
+                _while_i += 1
+
+        This loop→branch nesting forces the compiler to handle
+        reconvergence inside a loop body, stressing the ``scf.while``
+        lowering combined with ``scf.if`` nesting.
+        """
+        rng = self.rng
+        src = self.symtab.pick_random(rng, is_block=True, shape=())
+        op1 = self.symtab.pick_random(rng, is_block=True, shape=())
+        op2 = self.symtab.pick_random(rng, is_block=True, shape=())
+        if src is None or op1 is None or op2 is None:
+            return
+
+        acc_name = self.symtab.fresh_name("v")
+        counter_name = f"_while_i_{self.symtab._counter}"
+        max_iter = self.while_max_iter
+        accum_op_true = rng.choice(_LOOP_ACCUM_OPS)
+        accum_op_false = rng.choice(_LOOP_ACCUM_OPS)
+
+        # Data-dependent loop condition
+        idx = rng.randint(0, len(_COND_REDUCTION_TRITON) - 1)
+        triton_red = _COND_REDUCTION_TRITON[idx]
+        torch_red = _COND_REDUCTION_TORCH[idx]
+        cmp = rng.choice(_COND_COMPARISONS)
+        threshold = rng.choice(["2.0", "5.0", "10.0", "20.0"])
+
+        # Inner branch condition (different reduction)
+        idx2 = rng.randint(0, len(_COND_REDUCTION_TRITON) - 1)
+        triton_inner_red = _COND_REDUCTION_TRITON[idx2]
+        torch_inner_red = _COND_REDUCTION_TORCH[idx2]
+        inner_cmp = rng.choice(_COND_COMPARISONS)
+        inner_threshold = rng.choice(_COND_THRESHOLDS)
+
+        # Initialise
+        self._triton_body.append(f"{acc_name} = {src.name}")
+        self._torch_body.append(f"{acc_name} = {src.name}")
+        self._triton_body.append(f"{counter_name} = 0")
+        self._torch_body.append(f"{counter_name} = 0")
+
+        # While header
+        triton_cond = f"{triton_red.format(acc_name)} {cmp} {threshold} and {counter_name} < {max_iter}"
+        torch_cond = f"{torch_red.format(acc_name)} {cmp} {threshold} and {counter_name} < {max_iter}"
+        self._triton_body.append(f"while {triton_cond}:")
+        self._torch_body.append(f"while {torch_cond}:")
+
+        # Inner if/else
+        triton_inner_cond = f"{triton_inner_red.format(acc_name)} {inner_cmp} {inner_threshold}"
+        torch_inner_cond = f"{torch_inner_red.format(acc_name)} {inner_cmp} {inner_threshold}"
+        self._triton_body.append(f"    if {triton_inner_cond}:")
+        self._torch_body.append(f"    if {torch_inner_cond}:")
+
+        self._triton_body.append(
+            f"        {acc_name} = {acc_name} {accum_op_true} {op1.name}"
+        )
+        self._torch_body.append(
+            f"        {acc_name} = {acc_name} {accum_op_true} {op1.name}"
+        )
+
+        self._triton_body.append("    else:")
+        self._torch_body.append("    else:")
+
+        self._triton_body.append(
+            f"        {acc_name} = {acc_name} {accum_op_false} {op2.name}"
+        )
+        self._torch_body.append(
+            f"        {acc_name} = {acc_name} {accum_op_false} {op2.name}"
+        )
+
+        # Counter increment
+        self._triton_body.append(f"    {counter_name} += 1")
+        self._torch_body.append(f"    {counter_name} += 1")
+
+        out_dt = promote(promote(src.dtype, op1.dtype), op2.dtype)
+        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
+        self._ops_used.append("loop_with_branch")
+
+    def _emit_while_in_if(self) -> None:
+        """Emit an if/else where the true branch contains a while-loop.
+
+        Pattern::
+
+            if <cond>:
+                v_N = <source>
+                _while_i = 0
+                while <data_cond> and _while_i < MAX_ITER:
+                    v_N = v_N <op> <operand>
+                    _while_i += 1
+            else:
+                v_N = <simple_op>(v_X)
+        """
+        rng = self.rng
+        triton_cond, torch_cond = self._make_scalar_condition()
+        out_name = self.symtab.fresh_name("v")
+        snap = self.symtab.snapshot()
+
+        # ── IF header ────────────────────────────────────────────────
+        self._triton_body.append(f"if {triton_cond}:")
+        self._torch_body.append(f"if {torch_cond}:")
+
+        # True branch: while-loop (indented by 4)
+        src = self.symtab.pick_random(rng, is_block=True, shape=())
+        operand = self.symtab.pick_random(rng, is_block=True, shape=())
+        if src is None or operand is None:
+            # Fallback: emit a simple op
+            self._emit_one_op(indent="    ")
+            true_last = self.symtab.last_var()
+            if true_last:
+                self._triton_body.append(f"    {out_name} = {true_last.name}")
+                self._torch_body.append(f"    {out_name} = {true_last.name}")
+                true_dtype = true_last.dtype
+                true_shape = true_last.shape
+            else:
+                self._triton_body.append(f"    {out_name} = 0.0")
+                self._torch_body.append(f"    {out_name} = 0.0")
+                true_dtype = FLOAT32
+                true_shape = ()
+        else:
+            counter_name = f"_while_i_{self.symtab._counter}"
+            accum_op = rng.choice(_LOOP_ACCUM_OPS)
+            max_iter = self.while_max_iter
+
+            idx = rng.randint(0, len(_COND_REDUCTION_TRITON) - 1)
+            triton_red = _COND_REDUCTION_TRITON[idx]
+            torch_red = _COND_REDUCTION_TORCH[idx]
+            loop_cmp = rng.choice(_COND_COMPARISONS)
+            loop_threshold = rng.choice(["2.0", "5.0", "10.0", "20.0"])
+
+            self._triton_body.append(f"    {out_name} = {src.name}")
+            self._torch_body.append(f"    {out_name} = {src.name}")
+            self._triton_body.append(f"    {counter_name} = 0")
+            self._torch_body.append(f"    {counter_name} = 0")
+
+            triton_loop_cond = (
+                f"{triton_red.format(out_name)} {loop_cmp} {loop_threshold}"
+                f" and {counter_name} < {max_iter}"
+            )
+            torch_loop_cond = (
+                f"{torch_red.format(out_name)} {loop_cmp} {loop_threshold}"
+                f" and {counter_name} < {max_iter}"
+            )
+            self._triton_body.append(f"    while {triton_loop_cond}:")
+            self._torch_body.append(f"    while {torch_loop_cond}:")
+
+            self._triton_body.append(
+                f"        {out_name} = {out_name} {accum_op} {operand.name}"
+            )
+            self._torch_body.append(
+                f"        {out_name} = {out_name} {accum_op} {operand.name}"
+            )
+            self._triton_body.append(f"        {counter_name} += 1")
+            self._torch_body.append(f"        {counter_name} += 1")
+
+            true_dtype = promote(src.dtype, operand.dtype)
+            true_shape = src.shape
+
+        # ── ELSE branch ──────────────────────────────────────────────
+        self.symtab.restore(snap)
+
+        self._triton_body.append("else:")
+        self._torch_body.append("else:")
+
+        for _ in range(self.if_else_branch_ops):
+            self._emit_one_op(indent="    ")
+        false_last = self.symtab.last_var()
+        if false_last is not None:
+            self._triton_body.append(f"    {out_name} = {false_last.name}")
+            self._torch_body.append(f"    {out_name} = {false_last.name}")
+            false_dtype = false_last.dtype
+            false_shape = false_last.shape
+        else:
+            fb = self.symtab.pick_random(rng)
+            fb_name = fb.name if fb else "0.0"
+            self._triton_body.append(f"    {out_name} = {fb_name}")
+            self._torch_body.append(f"    {out_name} = {fb_name}")
+            false_dtype = fb.dtype if fb else FLOAT32
+            false_shape = fb.shape if fb else ()
+
+        # ── Register unified output ──────────────────────────────────
+        self.symtab.restore(snap)
+        out_dt = promote(true_dtype, false_dtype)
+        self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=true_shape))
+        self._ops_used.append("while_in_if")
+
     # ================================================================== #
     #  Phase 4 – Choose output variable                                    #
     # ================================================================== #
@@ -681,7 +1267,7 @@ class KernelBuilder:
 
     def _build_metadata(self) -> dict:
         meta = {
-            "generator_version": "0.4.0",
+            "generator_version": "0.5.0",
             "seed": self.seed,
             "num_inputs": self.num_inputs,
             "input_dtypes": [d.torch for d in self.input_dtypes],
@@ -701,6 +1287,12 @@ class KernelBuilder:
             "mix_dtypes": self.mix_dtypes,
             "has_atomics": self.use_atomic,
             "use_dot": self.use_dot,
+            # ── Divergent control flow ───────────────────────────────
+            "has_if_else": self.insert_if_else,
+            "has_while_loop": self.insert_while_loop,
+            "while_max_iter": self.while_max_iter if self.insert_while_loop or self.insert_nested_cf else 0,
+            "has_nested_cf": self.insert_nested_cf,
+            "nested_cf_pattern": self.nested_cf_pattern,
         }
         if self.use_atomic and self.atomic_op is not None:
             meta["atomic_op"] = self.atomic_op.name

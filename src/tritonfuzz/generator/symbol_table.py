@@ -106,5 +106,26 @@ class SymbolTable:
             return None
         return self._vars.get(self._order[-1])
 
+    # ── Snapshot / Restore (for branching control flow) ──────────────────
+
+    def snapshot(self) -> dict:
+        """Capture the current state so it can be restored later.
+
+        Used by if/else emission: both branches start from the same
+        symbol-table state, and only the unified output is registered
+        after the branch.
+        """
+        return {
+            "vars": dict(self._vars),
+            "counter": self._counter,
+            "order": list(self._order),
+        }
+
+    def restore(self, snap: dict) -> None:
+        """Restore a previously captured snapshot."""
+        self._vars = dict(snap["vars"])
+        self._counter = snap["counter"]
+        self._order = list(snap["order"])
+
     def __len__(self) -> int:
         return len(self._vars)

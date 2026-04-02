@@ -39,7 +39,8 @@ class OpCategory(str, Enum):
     ATOMIC             = "atomic"
     DOT                = "dot"
 
-    REDUCTION    = "reduction"
+    REDUCTION       = "reduction"
+    LAYOUT_CONVERT  = "layout_convert"
 
     # Future stubs
     POINTER_MATH = "pointer_math"
@@ -186,6 +187,7 @@ CATEGORY_WEIGHTS: dict[OpCategory, float] = {
     OpCategory.LOGIC:              2.0,
     OpCategory.TYPE_CAST:          1.5,
     OpCategory.REDUCTION:          1.5,
+    OpCategory.LAYOUT_CONVERT:     2.0,
 }
 
 # ── Comparison primitives for ``tl.where`` condition expressions ─────────────

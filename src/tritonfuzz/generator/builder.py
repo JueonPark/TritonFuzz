@@ -30,7 +30,13 @@ from tritonfuzz.generator.ops import (
     pick_op_from_category,
     pick_reduction_op,
 )
-from tritonfuzz.generator.symbol_table import SymbolTable, TensorVar
+from tritonfuzz.generator.symbol_table import (
+    SymbolTable,
+    TensorVar,
+    flatten_shape_expr,
+    shapes_same_numel,
+    transpose_shape,
+)
 from tritonfuzz.generator.types import (
     CAST_TARGET_DTYPES,
     BFLOAT16,
@@ -79,6 +85,16 @@ _DOT_DIM_CHOICES: list[int] = [64, 128, 256]
 _DOT_K_CHOICES: list[int] = [32, 64, 128]
 _DOT_INPUT_DTYPES: list[DType] = [FLOAT16, BFLOAT16, FLOAT32]
 _DOT_INPUT_WEIGHTS: list[float] = [3.0, 3.0, 1.0]
+
+# ── Layout-conversion op weights (for _emit_layout_op dispatcher) ────
+
+_LAYOUT_OP_CHOICES: list[str] = [
+    "trans",
+    "reshape_flatten",
+    "reshape_unflatten",
+    "expand_broadcast",
+]
+_LAYOUT_OP_WEIGHTS: list[float] = [3.0, 2.5, 2.5, 2.0]
 
 
 class KernelBuilder:
@@ -131,6 +147,17 @@ class KernelBuilder:
         self.dot_post_ops: int = 0
         self.dot_input_dtype: Optional[DType] = None
         self._dot_acc_name: str = ""
+
+        # ── Layout-conversion stress (dot mode only) ─────────────────
+        self.dot_layout_ops: int = 0
+        self.dot_use_layout_stress: bool = False
+        self.dot_square_blocks: bool = False
+
+        # ── Multi-dot mode (chained tl.dot with layout conversion) ───
+        self.use_multi_dot: bool = False
+        self.multi_dot_P: int = 0
+        self.multi_dot_BLOCK_P: int = 0
+        self._multi_dot_acc2_name: str = ""
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -283,12 +310,51 @@ class KernelBuilder:
         # Number of element-wise post-ops on the dot result
         self.dot_post_ops = rng.randint(0, 3)
 
+        # Layout-conversion stress (30 % of dot kernels)
+        self.dot_use_layout_stress = rng.random() > 0.70
+        if self.dot_use_layout_stress:
+            self.dot_layout_ops = rng.randint(1, 3)
+            # Ensure enough post-ops so layout ops sit between compute ops
+            self.dot_post_ops = max(self.dot_post_ops, 2)
+            # Square blocks needed for reshape flatten/unflatten round-trips
+            self.dot_square_blocks = rng.random() > 0.5
+            if self.dot_square_blocks:
+                common = rng.choice(_DOT_BLOCK_CHOICES)
+                self.dot_BLOCK_M = common
+                self.dot_BLOCK_N = common
+                # Re-align M, N to the new common block size
+                m_choices = [d for d in _DOT_DIM_CHOICES if d >= common]
+                n_choices = [d for d in _DOT_DIM_CHOICES if d >= common]
+                self.dot_M = rng.choice(m_choices) if m_choices else common
+                self.dot_N = rng.choice(n_choices) if n_choices else common
+                self.dot_M = (self.dot_M // common) * common
+                self.dot_N = (self.dot_N // common) * common
+        else:
+            self.dot_layout_ops = 0
+
         # Override general planning for dot mode
         self.num_inputs = 2
         self.input_dtypes = [self.dot_input_dtype, self.dot_input_dtype]
         self.num_body_ops = self.dot_post_ops
         self.use_mask = False  # dimensions are aligned, no masking needed
         self.n_elements = self.dot_M * self.dot_N  # total output elements
+
+        # Multi-dot: chained tl.dot with transpose between them (5 %)
+        # Requires square blocks: BLOCK_M == BLOCK_N so that the
+        # transposed accumulator can be used as input to a second tl.dot.
+        # Pattern: acc1 = dot(A, B) → trans(acc1) → acc2 = dot(trans, C)
+        if rng.random() > 0.95 and self.dot_BLOCK_M == self.dot_BLOCK_N:
+            self.use_multi_dot = True
+            # Third matrix C has shape (N, P) → dot(acc1.T, C) gives (M, P)
+            # For simplicity, use P == N and BLOCK_P == BLOCK_N
+            self.multi_dot_P = self.dot_N
+            self.multi_dot_BLOCK_P = self.dot_BLOCK_N
+            self.num_inputs = 3
+            self.input_dtypes = [self.dot_input_dtype] * 3
+            self.n_elements = self.dot_M * self.multi_dot_P
+            # Force layout stress on for multi-dot
+            self.dot_use_layout_stress = True
+            self.dot_layout_ops = max(self.dot_layout_ops, 1)
 
     # ================================================================== #
     #  Phase 2 – Emit loads (§4.2.1)                                       #
@@ -383,22 +449,121 @@ class KernelBuilder:
             ops_emitted += 1
 
     def _emit_dot_body(self) -> None:
-        """Register the dot accumulator and emit optional post-ops."""
+        """Register the dot accumulator and emit optional post-ops.
+
+        When layout-stress mode is active, layout-conversion operations
+        (transpose, reshape flatten/unflatten, expand+broadcast) are
+        interspersed among the element-wise post-ops to force the Triton
+        compiler to emit intermediate layout conversions between
+        Blocked / Shared / DotOperand / Slice encodings.
+        """
+        if self.use_multi_dot:
+            self._emit_multi_dot_body()
+            return
+
         acc_name = self.symtab.fresh_name("v")
         dot_shape = ("BLOCK_M", "BLOCK_N")
         self.symtab.add(TensorVar(acc_name, FLOAT32, is_block=True, shape=dot_shape))
         self._dot_acc_name = acc_name
         self._ops_used.append("dot")
 
-        # Emit optional element-wise post-ops on the accumulator
-        for _ in range(self.dot_post_ops):
-            self._emit_one_op()
+        if not self.dot_use_layout_stress:
+            # Simple path: just element-wise post-ops
+            for _ in range(self.dot_post_ops):
+                self._emit_one_op()
+            return
+
+        # Layout-stress path: interleave layout ops among post-ops.
+        # Pattern: 1-2 post-ops, layout-op, 1-2 post-ops, layout-op, …
+        layout_ops_remaining = self.dot_layout_ops
+        post_ops_remaining = self.dot_post_ops
+        rng = self.rng
+
+        while post_ops_remaining > 0 or layout_ops_remaining > 0:
+            # Emit 1-2 element-wise post-ops
+            chunk = min(rng.randint(1, 2), post_ops_remaining)
+            for _ in range(chunk):
+                self._emit_one_op()
+                post_ops_remaining -= 1
+
+            # Emit a layout op (if any remaining)
+            if layout_ops_remaining > 0:
+                self._emit_layout_op()
+                layout_ops_remaining -= 1
+
+        # Ensure the final variable has the correct shape for the store
+        self._ensure_output_shape(dot_shape)
+
+    def _emit_multi_dot_body(self) -> None:
+        """Emit a chained dot pattern: dot → trans → dot.
+
+        Pattern::
+
+            acc1   = tl.dot(A_tile, B_tile)    # (BLOCK_M, BLOCK_N)
+            acc1_t = tl.trans(acc1)             # (BLOCK_N, BLOCK_M)
+            acc2   = tl.dot(acc1_t, C_tile)    # (BLOCK_N, BLOCK_P)
+
+        Since BLOCK_M == BLOCK_N (square), the transposed acc1 has shape
+        (BLOCK_M, BLOCK_M) and can be used as a valid dot-LHS.  The
+        output is (BLOCK_M, BLOCK_P) where BLOCK_P == BLOCK_N.
+
+        This forces the compiler to handle DotOperand → Shared → Blocked
+        layout conversions across the transpose boundary.
+        """
+        dot_shape = ("BLOCK_M", "BLOCK_N")
+
+        # First dot accumulator (handled by assembly template)
+        acc1_name = self.symtab.fresh_name("v")
+        self.symtab.add(TensorVar(acc1_name, FLOAT32, is_block=True, shape=dot_shape))
+        self._dot_acc_name = acc1_name
+        self._ops_used.append("dot")
+
+        # Transpose: (BLOCK_M, BLOCK_N) → (BLOCK_N, BLOCK_M)
+        trans_name = self.symtab.fresh_name("v")
+        self._triton_body.append(f"{trans_name} = tl.trans({acc1_name})")
+        self._torch_body.append(f"{trans_name} = {acc1_name}.T")
+        trans_shape = transpose_shape(dot_shape)
+        self.symtab.add(TensorVar(trans_name, FLOAT32, is_block=True, shape=trans_shape))
+        self._ops_used.append("trans")
+
+        # Second dot: emit as body code (not in assembly K-loop)
+        # acc2 = tl.dot(acc1_t, C_tile) where C_tile loads are inlined
+        acc2_name = self.symtab.fresh_name("v")
+        # This second dot is represented as element-wise ops in the body;
+        # the actual second tl.dot call is assembled in the template.
+        self.symtab.add(TensorVar(acc2_name, FLOAT32, is_block=True, shape=dot_shape))
+        self._multi_dot_acc2_name = acc2_name
+        self._ops_used.append("dot")
+
+        # Optional post-ops on the final accumulator
+        layout_ops_remaining = self.dot_layout_ops
+        post_ops_remaining = self.dot_post_ops
+        rng = self.rng
+
+        while post_ops_remaining > 0 or layout_ops_remaining > 0:
+            chunk = min(rng.randint(1, 2), post_ops_remaining)
+            for _ in range(chunk):
+                self._emit_one_op()
+                post_ops_remaining -= 1
+            if layout_ops_remaining > 0:
+                self._emit_layout_op()
+                layout_ops_remaining -= 1
+
+        self._ensure_output_shape(dot_shape)
 
     # ── Single-op dispatcher ─────────────────────────────────────────────
 
     def _emit_one_op(self, indent: str = "") -> None:
         rng = self.rng
         category = pick_category(rng)
+
+        if category == OpCategory.LAYOUT_CONVERT:
+            # Layout ops only useful in dot mode (2D tensors).
+            if self.use_dot:
+                self._emit_layout_op(indent)
+            # In 1D mode, fall-through to a binary op instead.
+            else:
+                category = OpCategory.ELEMENTWISE_BINARY
 
         if category == OpCategory.TYPE_CAST:
             self._emit_cast(indent)
@@ -457,6 +622,14 @@ class KernelBuilder:
         if a is None or b is None:
             return
 
+        # In dot mode with layout ops, tensors may have different shapes
+        # (e.g. 2-D vs 1-D after flatten).  Ensure both operands share
+        # the same shape to avoid Triton shape-mismatch errors.
+        if a.shape != b.shape:
+            b = self.symtab.pick_random(rng, shape=a.shape)
+            if b is None:
+                b = a  # self-op as last resort
+
         out_name = self.symtab.fresh_name("v")
         self._triton_body.append(
             f"{indent}{out_name} = {op.triton_fmt.format(a.name, b.name)}"
@@ -483,6 +656,16 @@ class KernelBuilder:
         true_var, false_var = self.symtab.pick_two(rng, prefer_same_dtype=True)
         if true_var is None or false_var is None:
             return
+
+        # Ensure all three operands share the same shape
+        if cond_var.shape != true_var.shape:
+            true_var = self.symtab.pick_random(rng, shape=cond_var.shape)
+            if true_var is None:
+                return
+        if false_var.shape != true_var.shape:
+            false_var = self.symtab.pick_random(rng, shape=true_var.shape)
+            if false_var is None:
+                false_var = true_var
 
         cmp = rng.choice(COMPARISON_OPS)
         threshold = rng.choice(COMPARISON_THRESHOLDS)
@@ -580,6 +763,215 @@ class KernelBuilder:
         out_dt = promote(block_var.dtype, inp.dtype)
         self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=block_var.shape))
         self._ops_used.append(red_op.name)
+
+    # ── Layout-conversion emission (dot mode only) ───────────────────────
+
+    def _emit_layout_op(self, indent: str = "") -> None:
+        """Dispatch to a random layout-conversion operation.
+
+        Layout ops only make sense when 2-D block tensors are present
+        (dot mode).  Each sub-emitter is responsible for gracefully
+        returning if no suitable operand exists.
+        """
+        rng = self.rng
+        choice = rng.choices(_LAYOUT_OP_CHOICES, weights=_LAYOUT_OP_WEIGHTS, k=1)[0]
+
+        if choice == "trans":
+            self._emit_trans(indent)
+        elif choice == "reshape_flatten":
+            self._emit_reshape_flatten(indent)
+        elif choice == "reshape_unflatten":
+            self._emit_reshape_unflatten(indent)
+        elif choice == "expand_broadcast":
+            self._emit_expand_broadcast(indent)
+
+    def _emit_trans(self, indent: str = "") -> None:
+        """Emit ``tl.trans(x)`` on a 2-D block tensor.
+
+        Triton: ``v_N = tl.trans(v_M)``
+        Torch:  ``v_N = v_M.T``
+
+        Forces a layout conversion between Blocked and Shared encodings
+        in the Triton MLIR pipeline.
+        """
+        rng = self.rng
+        inp = self.symtab.pick_random_by_ndim(rng, 2, require_float=True)
+        if inp is None:
+            inp = self.symtab.pick_random_by_ndim(rng, 2)
+        if inp is None:
+            return
+
+        out_name = self.symtab.fresh_name("v")
+
+        # Randomly choose between tl.trans() and tl.permute() for more
+        # MLIR path coverage.
+        if rng.random() > 0.5:
+            self._triton_body.append(f"{indent}{out_name} = tl.trans({inp.name})")
+        else:
+            self._triton_body.append(f"{indent}{out_name} = tl.permute({inp.name}, (1, 0))")
+        self._torch_body.append(f"{indent}{out_name} = {inp.name}.T")
+
+        out_shape = transpose_shape(inp.shape)
+        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True, shape=out_shape))
+        self._ops_used.append("trans")
+
+    def _emit_reshape_flatten(self, indent: str = "") -> None:
+        """Flatten a 2-D block tensor to 1-D via ``tl.reshape``.
+
+        Triton: ``v_N = tl.reshape(v_M, (BLOCK_M * BLOCK_N,))``
+        Torch:  ``v_N = v_M.reshape(M * N)``
+
+        Randomly toggles ``can_reorder=True`` to stress both MLIR
+        lowering paths.
+        """
+        rng = self.rng
+        inp = self.symtab.pick_random_by_ndim(rng, 2)
+        if inp is None:
+            return
+
+        numel_expr = flatten_shape_expr(inp.shape)  # e.g. "BLOCK_M * BLOCK_N"
+        flat_shape = (numel_expr,)                    # 1-D symbolic shape
+
+        out_name = self.symtab.fresh_name("v")
+        can_reorder = rng.choice(["True", "False"])
+        self._triton_body.append(
+            f"{indent}{out_name} = tl.reshape({inp.name}, ({numel_expr},), can_reorder={can_reorder})"
+        )
+        self._torch_body.append(
+            f"{indent}{out_name} = {inp.name}.reshape(-1)"
+        )
+
+        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True, shape=flat_shape))
+        self._ops_used.append("reshape_flatten")
+
+    def _emit_reshape_unflatten(self, indent: str = "") -> None:
+        """Unflatten a 1-D block tensor back to 2-D via ``tl.reshape``.
+
+        Only operates on 1-D tensors whose symbolic element count matches
+        ``BLOCK_M * BLOCK_N`` (i.e. produced by a prior flatten).
+
+        Triton: ``v_N = tl.reshape(v_M, (BLOCK_M, BLOCK_N))``
+        Torch:  ``v_N = v_M.reshape(M, N)``
+        """
+        rng = self.rng
+        dot_shape = ("BLOCK_M", "BLOCK_N")
+        flat_numel = flatten_shape_expr(dot_shape)  # "BLOCK_M * BLOCK_N"
+
+        # Find a 1-D variable whose shape is the flattened form
+        candidates = [
+            v for v in self.symtab.all_vars()
+            if v.is_block and len(v.shape) == 1 and shapes_same_numel(v.shape, dot_shape)
+        ]
+        if not candidates:
+            return
+
+        inp = rng.choice(candidates)
+        out_name = self.symtab.fresh_name("v")
+        can_reorder = rng.choice(["True", "False"])
+        self._triton_body.append(
+            f"{indent}{out_name} = tl.reshape({inp.name}, (BLOCK_M, BLOCK_N), can_reorder={can_reorder})"
+        )
+        self._torch_body.append(
+            f"{indent}{out_name} = {inp.name}.reshape(M, N)"
+        )
+
+        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True, shape=dot_shape))
+        self._ops_used.append("reshape_unflatten")
+
+    def _emit_expand_broadcast(self, indent: str = "") -> None:
+        """Reduce → expand_dims → broadcast_to on a 2-D block tensor.
+
+        Three-step pattern that forces multiple layout conversions::
+
+            r   = tl.sum(x, axis=1)             # (BLOCK_M, BLOCK_N) → (BLOCK_M,)
+            e   = tl.expand_dims(r, 1)          # (BLOCK_M,) → (BLOCK_M, 1)
+            out = tl.broadcast_to(e, (BLOCK_M, BLOCK_N))  # → (BLOCK_M, BLOCK_N)
+
+        PyTorch equivalent::
+
+            r   = x.sum(dim=1)
+            out = r.unsqueeze(1).expand(M, N)
+        """
+        rng = self.rng
+        inp = self.symtab.pick_random_by_ndim(rng, 2, require_float=True)
+        if inp is None:
+            inp = self.symtab.pick_random_by_ndim(rng, 2)
+        if inp is None:
+            return
+
+        # Step 1: reduce along axis 1 → 1-D
+        red_name = self.symtab.fresh_name("r")
+        red_fn_triton = rng.choice(["tl.sum", "tl.max", "tl.min"])
+        red_fn_torch_map = {"tl.sum": "torch.sum", "tl.max": "torch.amax", "tl.min": "torch.amin"}
+        red_fn_torch = red_fn_torch_map[red_fn_triton]
+
+        self._triton_body.append(
+            f"{indent}{red_name} = {red_fn_triton}({inp.name}, axis=1)"
+        )
+        self._torch_body.append(
+            f"{indent}{red_name} = {red_fn_torch}({inp.name}, dim=1)"
+        )
+
+        # Step 2: expand_dims on the reduced result → 2-D with dim-1 column
+        exp_name = self.symtab.fresh_name("v")
+        self._triton_body.append(
+            f"{indent}{exp_name} = tl.expand_dims({red_name}, 1)"
+        )
+        self._torch_body.append(
+            f"{indent}{exp_name} = {red_name}.unsqueeze(1)"
+        )
+
+        # Step 3: broadcast back to original 2-D shape
+        out_name = self.symtab.fresh_name("v")
+        self._triton_body.append(
+            f"{indent}{out_name} = tl.broadcast_to({exp_name}, ({inp.shape[0]}, {inp.shape[1]}))"
+        )
+        self._torch_body.append(
+            f"{indent}{out_name} = {exp_name}.expand({inp.shape[0]}, {inp.shape[1]})"
+        )
+
+        self.symtab.add(TensorVar(out_name, inp.dtype, is_block=True, shape=inp.shape))
+        self._ops_used.append("expand_broadcast")
+
+    def _ensure_output_shape(self, target_shape: tuple[str, ...]) -> None:
+        """If the last variable's shape differs from *target_shape*,
+        emit a corrective ``tl.reshape`` or ``tl.trans`` so that the
+        store epilogue can use the expected indexing pattern.
+        """
+        last = self.symtab.last_var()
+        if last is None or last.shape == target_shape:
+            return
+
+        out_name = self.symtab.fresh_name("v")
+
+        # Case 1: transposed 2-D → just transpose back
+        if transpose_shape(last.shape) == target_shape and len(last.shape) == 2:
+            self._triton_body.append(f"{out_name} = tl.trans({last.name})")
+            self._torch_body.append(f"{out_name} = {last.name}.T")
+            self.symtab.add(TensorVar(out_name, last.dtype, is_block=True, shape=target_shape))
+            self._ops_used.append("trans_fixup")
+            return
+
+        # Case 2: flattened 1-D → reshape back to 2-D
+        if shapes_same_numel(last.shape, target_shape):
+            target_dims = ", ".join(target_shape)
+            self._triton_body.append(
+                f"{out_name} = tl.reshape({last.name}, ({target_dims},))"
+            )
+            if len(target_shape) == 2:
+                self._torch_body.append(
+                    f"{out_name} = {last.name}.reshape({target_shape[0]}, {target_shape[1]})"
+                )
+            else:
+                self._torch_body.append(
+                    f"{out_name} = {last.name}.reshape(-1)"
+                )
+            self.symtab.add(TensorVar(out_name, last.dtype, is_block=True, shape=target_shape))
+            self._ops_used.append("reshape_fixup")
+            return
+
+        # Case 3: incompatible — shouldn't happen with well-planned ops.
+        # As a safety net, reuse the last variable without shape change.
 
     # ── For-loop emission (§4.3 Control Flow) ────────────────────────────
 
@@ -1174,6 +1566,9 @@ class KernelBuilder:
 
     def _assemble_dot_triton_source(self) -> str:
         """Assemble a matmul-tile kernel using ``tl.dot``."""
+        if self.use_multi_dot:
+            return self._assemble_multi_dot_triton_source()
+
         seed = self.seed
         acc = self._dot_acc_name
         out_var = self._output_var.name if self._output_var else acc
@@ -1218,6 +1613,79 @@ class KernelBuilder:
 
         return "\n".join(lines) + "\n"
 
+    def _assemble_multi_dot_triton_source(self) -> str:
+        """Assemble a chained-dot kernel: dot(A,B) → trans → dot(T,C)."""
+        seed = self.seed
+        acc1 = self._dot_acc_name
+        acc2 = self._multi_dot_acc2_name
+        out_var = self._output_var.name if self._output_var else acc2
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            "    a_ptr, b_ptr, c_ptr, out_ptr,",
+            "    M, N, K, P,",
+            "    stride_am, stride_ak,",
+            "    stride_bk, stride_bn,",
+            "    stride_cn2, stride_cp,",
+            "    stride_om, stride_op,",
+            "    BLOCK_M: tl.constexpr,",
+            "    BLOCK_N: tl.constexpr,",
+            "    BLOCK_K: tl.constexpr,",
+            "    BLOCK_P: tl.constexpr,",
+            "):",
+            "    pid_m = tl.program_id(0)",
+            "    pid_n = tl.program_id(1)",
+            "    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)",
+            "    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)",
+            # First dot: A @ B → acc1 (BLOCK_M, BLOCK_N)
+            f"    {acc1} = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)",
+            "    for k_start in range(0, K, BLOCK_K):",
+            "        offs_k = k_start + tl.arange(0, BLOCK_K)",
+            "        a = tl.load(a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)",
+            "        b = tl.load(b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)",
+            f"        {acc1} += tl.dot(a, b)",
+        ]
+
+        # Body includes: trans(acc1), then second dot is inline
+        # The body lines handle: trans_name = tl.trans(acc1), acc2 = ...
+        # But we also need the second K-loop for dot(trans, C).
+        # Since multi-dot body already emitted trans into _triton_body,
+        # we emit the second loop here with acc2 as accumulator.
+
+        # Emit the trans line from body (first line is the trans)
+        if self._triton_body:
+            lines.append(f"    {self._triton_body[0]}")  # trans line
+
+        # Second dot: trans(acc1) @ C → acc2
+        lines.extend([
+            f"    offs_p = pid_n * BLOCK_P + tl.arange(0, BLOCK_P)",
+            f"    {acc2} = tl.zeros((BLOCK_N, BLOCK_P), dtype=tl.float32)",
+            "    for n_start in range(0, N, BLOCK_N):",
+            "        offs_n2 = n_start + tl.arange(0, BLOCK_N)",
+            "        c_tile = tl.load(c_ptr + offs_n2[:, None] * stride_cn2 + offs_p[None, :] * stride_cp)",
+        ])
+        # The trans result has shape (BLOCK_N, BLOCK_M); since M==N, this is fine
+        # We use it as the left operand to dot
+        trans_name = self._triton_body[0].split("=")[0].strip() if self._triton_body else acc1
+        lines.append(f"        {acc2} += tl.dot({trans_name}.to(tl.float16), c_tile)")
+
+        # Remaining body lines (post-ops after the trans and acc2 registration)
+        for line in self._triton_body[1:]:
+            lines.append(f"    {line}")
+
+        # Store
+        lines.extend([
+            "    c_out = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_op",
+            f"    tl.store(c_out, {out_var})",
+        ])
+
+        return "\n".join(lines) + "\n"
+
     def _assemble_torch_ref_source(self) -> str:
         if self.use_dot:
             return self._assemble_dot_torch_ref_source()
@@ -1242,6 +1710,9 @@ class KernelBuilder:
 
     def _assemble_dot_torch_ref_source(self) -> str:
         """Assemble the PyTorch reference for a dot kernel."""
+        if self.use_multi_dot:
+            return self._assemble_multi_dot_torch_ref_source()
+
         seed = self.seed
         acc = self._dot_acc_name
         out_var = self._output_var.name if self._output_var else acc
@@ -1254,7 +1725,49 @@ class KernelBuilder:
             f"    {acc} = torch.matmul(a.float(), b.float())",
         ]
 
+        # When layout ops are used, the body references M, N, BLOCK_M,
+        # BLOCK_N via reshape / expand calls.  Derive them from the
+        # accumulator's actual shape so the reference is self-contained.
+        if self.dot_use_layout_stress:
+            lines.append(f"    M, N = {acc}.shape")
+            lines.append(f"    BLOCK_M, BLOCK_N = M, N")
+
         for line in self._torch_body:
+            lines.append(f"    {line}")
+
+        lines.append(f"    return {out_var}")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_multi_dot_torch_ref_source(self) -> str:
+        """Assemble the PyTorch reference for a chained-dot kernel."""
+        seed = self.seed
+        acc1 = self._dot_acc_name
+        acc2 = self._multi_dot_acc2_name
+        out_var = self._output_var.name if self._output_var else acc2
+
+        lines: list[str] = [
+            "import torch",
+            "",
+            "",
+            f"def torch_ref_seed_{seed}(a, b, c):",
+            f"    {acc1} = torch.matmul(a.float(), b.float())",
+        ]
+
+        # First torch_body line is the trans
+        if self._torch_body:
+            lines.append(f"    {self._torch_body[0]}")
+
+        # Second matmul: trans(acc1) @ c
+        trans_name = self._torch_body[0].split("=")[0].strip() if self._torch_body else acc1
+        lines.append(f"    {acc2} = torch.matmul({trans_name}.half().float(), c.float())")
+
+        # Derive shape vars for layout ops
+        lines.append(f"    M, N = {acc2}.shape")
+        lines.append(f"    BLOCK_M, BLOCK_N = M, N")
+
+        # Remaining body lines (skip first which was trans)
+        for line in self._torch_body[1:]:
             lines.append(f"    {line}")
 
         lines.append(f"    return {out_var}")
@@ -1312,4 +1825,26 @@ class KernelBuilder:
             ]
             meta["output_shape"] = [self.dot_M, self.dot_N]
             meta["output_dtype"] = "torch.float32"  # dot accumulator is always fp32
+            # ── Layout-conversion stress ─────────────────────────────
+            meta["dot_layout_stress"] = self.dot_use_layout_stress
+            meta["dot_layout_ops"] = self.dot_layout_ops
+            meta["dot_square_blocks"] = self.dot_square_blocks
+            layout_ops = [
+                op for op in self._ops_used
+                if op in ("trans", "reshape_flatten", "reshape_unflatten",
+                          "expand_broadcast", "trans_fixup", "reshape_fixup")
+            ]
+            meta["layout_ops_used"] = layout_ops
+            # ── Multi-dot ────────────────────────────────────────────
+            meta["multi_dot"] = self.use_multi_dot
+            if self.use_multi_dot:
+                meta["multi_dot_P"] = self.multi_dot_P
+                meta["multi_dot_BLOCK_P"] = self.multi_dot_BLOCK_P
+                meta["num_inputs"] = 3
+                meta["input_shapes"] = [
+                    [self.dot_M, self.dot_K],
+                    [self.dot_K, self.dot_N],
+                    [self.dot_N, self.multi_dot_P],
+                ]
+                meta["output_shape"] = [self.dot_M, self.multi_dot_P]
         return meta

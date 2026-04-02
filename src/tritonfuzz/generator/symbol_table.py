@@ -15,6 +15,43 @@ from typing import Optional
 from tritonfuzz.generator.types import DType
 
 
+# ── Shape utilities ──────────────────────────────────────────────────────────
+
+
+def transpose_shape(shape: tuple[str, ...]) -> tuple[str, ...]:
+    """Swap the last two dimensions of a shape tuple."""
+    if len(shape) < 2:
+        return shape
+    return shape[:-2] + (shape[-1], shape[-2])
+
+
+def flatten_shape_expr(shape: tuple[str, ...]) -> str:
+    """Return a constexpr string for the total number of elements.
+
+    E.g. ``("BLOCK_M", "BLOCK_N")`` → ``"BLOCK_M * BLOCK_N"``.
+    """
+    if not shape:
+        return "BLOCK_SIZE"
+    return " * ".join(shape)
+
+
+def shapes_same_numel(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """Check whether two symbolic shapes have provably equal element counts.
+
+    This is a syntactic check: it normalises the dimension-name multisets
+    and compares them (e.g. ``("BLOCK_M", "BLOCK_N")`` vs.
+    ``("BLOCK_N", "BLOCK_M")`` → True because same names).
+    For the 1-D flat shape we represent the flattened result as a single
+    entry ``"BLOCK_M*BLOCK_N"`` whose parts are split and compared.
+    """
+    def _parts(s: tuple[str, ...]) -> list[str]:
+        out: list[str] = []
+        for d in (s if s else ("BLOCK_SIZE",)):
+            out.extend(p.strip() for p in d.split("*"))
+        return sorted(out)
+    return _parts(a) == _parts(b)
+
+
 @dataclass
 class TensorVar:
     """A named tensor variable tracked during generation."""
@@ -126,6 +163,24 @@ class SymbolTable:
         self._vars = dict(snap["vars"])
         self._counter = snap["counter"]
         self._order = list(snap["order"])
+
+    def pick_random_by_ndim(
+        self,
+        rng: random.Random,
+        ndim: int,
+        *,
+        require_float: bool = False,
+    ) -> Optional[TensorVar]:
+        """Pick a random block variable whose shape has *ndim* dimensions.
+
+        ``ndim=1`` matches 1-D blocks (``shape == ()``); ``ndim=2``
+        matches 2-D blocks (two-element shape tuples).
+        """
+        target_len = 0 if ndim == 1 else ndim
+        candidates = [v for v in self.all_vars() if v.is_block and len(v.shape) == target_len]
+        if require_float:
+            candidates = [v for v in candidates if v.dtype.is_float]
+        return rng.choice(candidates) if candidates else None
 
     def __len__(self) -> int:
         return len(self._vars)

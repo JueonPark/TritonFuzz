@@ -144,6 +144,8 @@ class Runtime:
         meta = kernel.metadata
         if meta.get("use_dot"):
             return self._allocate_dot_inputs(kernel)
+        if meta.get("use_gather"):
+            return self._allocate_gather_inputs(kernel)
 
         n_elements = meta.get("n_elements", 1024)
         num_inputs = meta.get("num_inputs", 1)
@@ -179,6 +181,41 @@ class Runtime:
         A = torch.randn(M, K, device=self._device, dtype=dt)
         B = torch.randn(K, N, device=self._device, dtype=dt)
         return [A, B]
+
+    def _allocate_gather_inputs(self, kernel: GeneratedKernel) -> list[torch.Tensor]:
+        """Allocate index + data tensors for a gather/scatter kernel.
+
+        Input 0 is an int32 index tensor whose values are clamped to
+        ``[0, n_elements)`` so all gather accesses are in-bounds.
+        Remaining inputs are data tensors of the appropriate dtypes.
+        """
+        meta = kernel.metadata
+        n_elements = meta.get("n_elements", 1024)
+        num_inputs = meta.get("num_inputs", 2)
+        dtype_strs: list[str] = meta.get("input_dtypes", ["torch.int32"] + ["torch.float32"] * (num_inputs - 1))
+
+        tensors: list[torch.Tensor] = []
+
+        # Input 0: index tensor (int32, values in [0, n_elements))
+        idx = torch.randint(0, n_elements, (n_elements,), device=self._device, dtype=torch.int32)
+        tensors.append(idx)
+
+        # Inputs 1..N: data tensors
+        for i in range(1, num_inputs):
+            dt_str = dtype_strs[i] if i < len(dtype_strs) else "torch.float32"
+            dt = _TORCH_DTYPE_MAP.get(dt_str, torch.float32)
+
+            if dt.is_floating_point:
+                t = torch.randn(n_elements, device=self._device, dtype=dt)
+            else:
+                info = torch.iinfo(dt)
+                low = max(info.min, -127)
+                high = min(info.max, 127) + 1
+                t = torch.randint(low, high, (n_elements,), device=self._device, dtype=dt)
+
+            tensors.append(t)
+
+        return tensors
 
     def _run_torch_ref(
         self,

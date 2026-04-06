@@ -42,6 +42,7 @@ from tritonfuzz.generator.types import (
     BFLOAT16,
     FLOAT16,
     FLOAT32,
+    INT32,
     DType,
     pick_float_dtype,
     pick_input_dtype,
@@ -95,6 +96,19 @@ _LAYOUT_OP_CHOICES: list[str] = [
     "expand_broadcast",
 ]
 _LAYOUT_OP_WEIGHTS: list[float] = [3.0, 2.5, 2.5, 2.0]
+
+# ── Block-pointer tunables ───────────────────────────────────────────
+
+# Block-pointer mode requires n_elements to be an exact multiple of
+# BLOCK_SIZE so that ``tl.advance`` steps are uniform.  We restrict
+# the choices accordingly.
+_BLOCK_PTR_BLOCK_SIZES: list[int] = [64, 128, 256]
+
+# ── Gather/scatter tunables ──────────────────────────────────────────
+
+# Maximum value for randomly generated indices (as a fraction of
+# n_elements) to keep accesses in-bounds.
+_GATHER_N_ELEMENTS_CHOICES: list[int] = [512, 1024, 2048, 4096]
 
 
 class KernelBuilder:
@@ -158,6 +172,13 @@ class KernelBuilder:
         self.multi_dot_P: int = 0
         self.multi_dot_BLOCK_P: int = 0
         self._multi_dot_acc2_name: str = ""
+
+        # ── Block-pointer mode (tl.make_block_ptr + tl.advance) ──────
+        self.use_block_ptr: bool = False
+
+        # ── Gather/scatter mode (indirect memory access) ─────────────
+        self.use_gather: bool = False
+        self.gather_data_inputs: int = 0  # how many data inputs use gather
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -248,6 +269,43 @@ class KernelBuilder:
             self.atomic_op = None
             self.insert_loop = False  # K-loop is built into dot template
             self._plan_dot()
+
+        # Block-pointer mode (15 % of NON-dot, NON-atomic kernels)
+        # Uses tl.make_block_ptr + tl.load(block_ptr) + tl.advance
+        # instead of explicit offset computation.  Mutually exclusive
+        # with dot mode and atomics (different store pattern).
+        if not self.use_dot and not self.use_atomic:
+            self.use_block_ptr = rng.random() > 0.85
+            if self.use_block_ptr:
+                # Block-pointer needs exact divisibility
+                self.block_size = rng.choice(_BLOCK_PTR_BLOCK_SIZES)
+                # Force n_elements to be an exact multiple of block_size
+                multiplier = rng.choice([4, 8, 16, 32])
+                self.n_elements = self.block_size * multiplier
+                self.use_mask = False  # no masking needed with exact divisibility
+
+        # Gather/scatter mode (12 % of NON-dot kernels)
+        # Adds an index tensor as the first input; subsequent data loads
+        # use tl.load(data_ptr + idx) where idx is loaded from the index
+        # tensor, exercising unstructured gather instruction generation.
+        # Compatible with block_ptr mode and atomics.
+        if not self.use_dot:
+            self.use_gather = rng.random() > 0.88
+            if self.use_gather:
+                # Require at least 1 data input to gather through
+                self.num_inputs = max(self.num_inputs, 2)
+                # How many of the data inputs use gathered indexing (1 or all)
+                self.gather_data_inputs = rng.randint(1, self.num_inputs - 1)
+                # Keep n_elements reasonable for gather
+                self.n_elements = rng.choice(_GATHER_N_ELEMENTS_CHOICES)
+                # First input is the index tensor (int32)
+                self.input_dtypes[0] = INT32
+                # Ensure we have enough dtype entries
+                while len(self.input_dtypes) < self.num_inputs:
+                    self.input_dtypes.append(pick_input_dtype(rng))
+                # Disable block_ptr if gather is on — they are different
+                # pointer strategies on the load side
+                self.use_block_ptr = False
 
         # ── Divergent control flow (not in dot mode) ─────────────────
         if not self.use_dot:
@@ -363,6 +421,12 @@ class KernelBuilder:
     def _emit_loads(self) -> None:
         if self.use_dot:
             return  # Dot loads are part of the K-loop in assembly
+        if self.use_gather:
+            self._emit_gather_loads()
+            return
+        if self.use_block_ptr:
+            self._emit_block_ptr_loads()
+            return
         for i in range(self.num_inputs):
             var_name = self.symtab.fresh_name("v")  # v_0, v_1, …
             dt = self.input_dtypes[i]
@@ -382,6 +446,83 @@ class KernelBuilder:
             self._triton_body.append(triton_line)
             self._torch_body.append(torch_line)
             self.symtab.add(TensorVar(var_name, dt, is_block=True))
+
+    def _emit_block_ptr_loads(self) -> None:
+        """Emit loads using ``tl.make_block_ptr`` / ``tl.load(block_ptr)``.
+
+        For each input, creates a block pointer in the assembly preamble
+        and loads via the structured-memory path.  The body lines emitted
+        here are just the ``tl.load`` calls; the ``make_block_ptr`` setup
+        lives in the assembly template.
+        """
+        for i in range(self.num_inputs):
+            var_name = self.symtab.fresh_name("v")
+            dt = self.input_dtypes[i]
+            # Block-pointer load: no explicit offsets, no mask
+            triton_line = f"{var_name} = tl.load(in_blk_ptr{i})"
+            torch_line = f"{var_name} = x{i}"
+
+            self._triton_body.append(triton_line)
+            self._torch_body.append(torch_line)
+            self.symtab.add(TensorVar(var_name, dt, is_block=True))
+        self._ops_used.append("block_ptr_load")
+
+    def _emit_gather_loads(self) -> None:
+        """Emit loads with indirect (gather) indexing.
+
+        Pattern — input 0 is an index tensor, inputs 1..N are data::
+
+            idx   = tl.load(idx_ptr + offsets, mask=mask)
+            v_0   = x0                      # torch ref
+            v_1   = tl.load(in_ptr1 + idx)  # gathered data
+
+        The index tensor contains pre-clamped int32 offsets so the
+        gather is always in-bounds.  Data inputs beyond
+        ``gather_data_inputs`` fall back to standard linear loads.
+        """
+        rng = self.rng
+        mask_arg = ", mask=mask" if self.use_mask else ""
+        other_arg_int = ", other=0" if self.use_mask else ""
+
+        # Load the index tensor (input 0 is always the index)
+        idx_name = self.symtab.fresh_name("idx")
+        self._triton_body.append(
+            f"{idx_name} = tl.load(idx_ptr + offsets{mask_arg}{other_arg_int})"
+        )
+        self._torch_body.append(
+            f"{idx_name} = x_idx"
+        )
+        # idx is int32, not a compute variable — don't add to symtab
+        # (it's only used for addressing)
+
+        # Load data inputs via gather
+        for i in range(self.num_inputs - 1):
+            data_idx = i + 1  # skip index input (input 0)
+            var_name = self.symtab.fresh_name("v")
+            dt = self.input_dtypes[data_idx]
+
+            if i < self.gather_data_inputs:
+                # Gathered load — use idx as the offset
+                other_arg = ""
+                if self.use_mask:
+                    other_val = "0.0" if dt.is_float else "0"
+                    other_arg = f", other={other_val}"
+                triton_line = f"{var_name} = tl.load(in_ptr{data_idx} + {idx_name}{mask_arg}{other_arg})"
+                torch_line = f"{var_name} = x{data_idx}[{idx_name}]"
+            else:
+                # Standard linear load for remaining inputs
+                other_arg = ""
+                if self.use_mask and self.mask_use_other:
+                    other_val = "0.0" if dt.is_float else "0"
+                    other_arg = f", other={other_val}"
+                triton_line = f"{var_name} = tl.load(in_ptr{data_idx} + offsets{mask_arg}{other_arg})"
+                torch_line = f"{var_name} = x{data_idx}"
+
+            self._triton_body.append(triton_line)
+            self._torch_body.append(torch_line)
+            self.symtab.add(TensorVar(var_name, dt, is_block=True))
+
+        self._ops_used.append("gather_load")
 
     # ================================================================== #
     #  Phase 3 – Emit body ops (§4.2 Tensor Graph Synthesis)               #
@@ -1523,6 +1664,10 @@ class KernelBuilder:
     def _assemble_triton_source(self) -> str:
         if self.use_dot:
             return self._assemble_dot_triton_source()
+        if self.use_block_ptr:
+            return self._assemble_block_ptr_triton_source()
+        if self.use_gather:
+            return self._assemble_gather_triton_source()
 
         seed = self.seed
         ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
@@ -1553,6 +1698,116 @@ class KernelBuilder:
             lines.append(f"    {line}")
 
         # ── Standard epilogue (§4.1.1) ───────────────────────────────────
+        if self.use_atomic and self.atomic_op is not None:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(
+                f"    {self.atomic_op.triton_fn}(out_ptr + offsets, {out_var}{mask_arg})"
+            )
+        else:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(f"    tl.store(out_ptr + offsets, {out_var}{mask_arg})")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_block_ptr_triton_source(self) -> str:
+        """Assemble a kernel using ``tl.make_block_ptr`` for loads/stores.
+
+        The structured-memory path (block pointers) exercises Triton's
+        memory hierarchy optimisations, including coalescing analysis,
+        swizzling, and ``tl.advance``-based pointer arithmetic.
+        """
+        seed = self.seed
+        out_var = self._output_var.name if self._output_var else "v_0"
+
+        # Build parameter list: raw base pointers + n_elements + BLOCK_SIZE
+        ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            f"    {ptr_args}, out_ptr,",
+            "    n_elements,",
+            "    BLOCK_SIZE: tl.constexpr,",
+            "):",
+            "    pid = tl.program_id(axis=0)",
+        ]
+
+        # Create block pointers for each input
+        for i in range(self.num_inputs):
+            lines.extend([
+                f"    in_blk_ptr{i} = tl.make_block_ptr(",
+                f"        base=in_ptr{i},",
+                "        shape=(n_elements,),",
+                "        strides=(1,),",
+                "        offsets=(pid * BLOCK_SIZE,),",
+                "        block_shape=(BLOCK_SIZE,),",
+                "        order=(0,),",
+                "    )",
+            ])
+
+        # Create block pointer for output
+        lines.extend([
+            "    out_blk_ptr = tl.make_block_ptr(",
+            "        base=out_ptr,",
+            "        shape=(n_elements,),",
+            "        strides=(1,),",
+            "        offsets=(pid * BLOCK_SIZE,),",
+            "        block_shape=(BLOCK_SIZE,),",
+            "        order=(0,),",
+            "    )",
+        ])
+
+        # Body (loads via block_ptr + computational ops)
+        for line in self._triton_body:
+            lines.append(f"    {line}")
+
+        # Store via block pointer
+        lines.append(f"    tl.store(out_blk_ptr, {out_var})")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_gather_triton_source(self) -> str:
+        """Assemble a kernel with indirect (gather) memory accesses.
+
+        Input 0 is an int32 index tensor.  Data inputs use
+        ``tl.load(data_ptr + idx)`` where ``idx`` comes from loading
+        the index tensor, exercising unstructured gather instructions.
+        """
+        seed = self.seed
+        out_var = self._output_var.name if self._output_var else "v_0"
+
+        # Build parameter list: idx_ptr, in_ptr1, in_ptr2, ..., out_ptr
+        data_ptrs = ", ".join(f"in_ptr{i}" for i in range(1, self.num_inputs))
+        all_ptrs = f"idx_ptr, {data_ptrs}" if data_ptrs else "idx_ptr"
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            f"    {all_ptrs}, out_ptr,",
+            "    n_elements,",
+            "    BLOCK_SIZE: tl.constexpr,",
+            "):",
+            "    pid = tl.program_id(axis=0)",
+            "    block_start = pid * BLOCK_SIZE",
+            "    offsets = block_start + tl.arange(0, BLOCK_SIZE)",
+        ]
+
+        if self.use_mask:
+            lines.append("    mask = offsets < n_elements")
+
+        # Body (includes gather loads + computational ops)
+        for line in self._triton_body:
+            lines.append(f"    {line}")
+
+        # Store epilogue
         if self.use_atomic and self.atomic_op is not None:
             mask_arg = ", mask=mask" if self.use_mask else ""
             lines.append(
@@ -1691,8 +1946,15 @@ class KernelBuilder:
             return self._assemble_dot_torch_ref_source()
 
         seed = self.seed
-        input_args = ", ".join(f"x{i}" for i in range(self.num_inputs))
         out_var = self._output_var.name if self._output_var else "v_0"
+
+        # Build parameter list matching the kernel convention
+        if self.use_gather:
+            # First arg is the index tensor, then data tensors
+            args = ["x_idx"] + [f"x{i}" for i in range(1, self.num_inputs)]
+            input_args = ", ".join(args)
+        else:
+            input_args = ", ".join(f"x{i}" for i in range(self.num_inputs))
 
         lines: list[str] = [
             "import torch",
@@ -1701,6 +1963,8 @@ class KernelBuilder:
             f"def torch_ref_seed_{seed}({input_args}):",
         ]
 
+        # For gather mode, the torch ref needs to slice data tensors
+        # using the index.  The _torch_body already uses x_idx and x1[idx_0].
         for line in self._torch_body:
             lines.append(f"    {line}")
 
@@ -1806,6 +2070,10 @@ class KernelBuilder:
             "while_max_iter": self.while_max_iter if self.insert_while_loop or self.insert_nested_cf else 0,
             "has_nested_cf": self.insert_nested_cf,
             "nested_cf_pattern": self.nested_cf_pattern,
+            # ── Pointer math modes ───────────────────────────────────
+            "use_block_ptr": self.use_block_ptr,
+            "use_gather": self.use_gather,
+            "gather_data_inputs": self.gather_data_inputs if self.use_gather else 0,
         }
         if self.use_atomic and self.atomic_op is not None:
             meta["atomic_op"] = self.atomic_op.name

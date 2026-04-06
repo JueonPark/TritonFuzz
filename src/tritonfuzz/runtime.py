@@ -281,7 +281,20 @@ class Runtime:
         jit_fn = self._load_jit_fn_from_source(kernel)
 
         grid = ((n_elements + block_size - 1) // block_size,)
-        jit_fn[grid](*inputs, out, n_elements, BLOCK_SIZE=block_size)
+
+        # Register-pressure mode may set explicit num_warps / num_stages
+        # to push the compiler into aggressive register allocation and
+        # shared-memory spilling paths.
+        launch_kwargs: dict[str, int] = {"BLOCK_SIZE": block_size}
+        if meta.get("use_reg_pressure"):
+            num_warps = meta.get("reg_pressure_num_warps")
+            num_stages = meta.get("reg_pressure_num_stages")
+            if num_warps is not None:
+                launch_kwargs["num_warps"] = num_warps
+            if num_stages is not None:
+                launch_kwargs["num_stages"] = num_stages
+
+        jit_fn[grid](*inputs, out, n_elements, **launch_kwargs)
 
         return out
 

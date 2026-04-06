@@ -110,6 +110,19 @@ _BLOCK_PTR_BLOCK_SIZES: list[int] = [64, 128, 256]
 # n_elements) to keep accesses in-bounds.
 _GATHER_N_ELEMENTS_CHOICES: list[int] = [512, 1024, 2048, 4096]
 
+# ── Register-pressure stress tunables ────────────────────────────────
+
+# Block sizes well past 1024 inflate per-thread register consumption
+# and force the MLIR pipeline into aggressive spilling / shared-memory
+# allocation paths.
+_REG_PRESSURE_BLOCK_SIZES: list[int] = [1024, 2048, 4096]
+_REG_PRESSURE_BODY_OPS_RANGE: tuple[int, int] = (10, 20)
+_REG_PRESSURE_LOOP_TRIP_RANGE: tuple[int, int] = (4, 16)
+_REG_PRESSURE_NUM_WARPS: list[int] = [1, 2, 4, 8, 16]
+_REG_PRESSURE_NUM_STAGES: list[int] = [1, 2, 3, 4, 5]
+# Parallel accumulation chain counts (all live simultaneously)
+_REG_PRESSURE_CHAIN_COUNTS: list[int] = [2, 3, 4]
+
 
 class KernelBuilder:
     """Stateful builder that constructs exactly one kernel + reference pair.
@@ -179,6 +192,12 @@ class KernelBuilder:
         # ── Gather/scatter mode (indirect memory access) ─────────────
         self.use_gather: bool = False
         self.gather_data_inputs: int = 0  # how many data inputs use gather
+
+        # ── Register-pressure stress mode ────────────────────────────────
+        self.use_reg_pressure: bool = False
+        self.reg_pressure_num_warps: int = 4
+        self.reg_pressure_num_stages: int = 2
+        self.reg_pressure_parallel_chains: int = 0
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -305,6 +324,37 @@ class KernelBuilder:
                     self.input_dtypes.append(pick_input_dtype(rng))
                 # Disable block_ptr if gather is on — they are different
                 # pointer strategies on the load side
+                self.use_block_ptr = False
+
+        # ── Register-pressure stress (15 % of NON-dot kernels) ──────
+        # Bumps BLOCK_SIZE well past 1024, generates many temporary
+        # variables, and forces high loop-unrolling to inflate register
+        # pressure and trigger spilling / shared-memory allocation paths.
+        if not self.use_dot:
+            self.use_reg_pressure = rng.random() > 0.85
+            if self.use_reg_pressure:
+                self.block_size = rng.choice(_REG_PRESSURE_BLOCK_SIZES)
+                # n_elements must be a multiple of block_size
+                multiplier = rng.choice([2, 4, 8])
+                self.n_elements = self.block_size * multiplier
+                # Many body ops ⇒ lots of live temporaries
+                self.num_body_ops = rng.randint(*_REG_PRESSURE_BODY_OPS_RANGE)
+                # Always insert a loop with high trip count
+                self.insert_loop = True
+                self.loop_trip_count = rng.randint(*_REG_PRESSURE_LOOP_TRIP_RANGE)
+                # Force 3 inputs for maximum data-flow diversity
+                self.num_inputs = 3
+                while len(self.input_dtypes) < self.num_inputs:
+                    self.input_dtypes.append(pick_input_dtype(rng))
+                # Explicit num_warps / num_stages for compiler stress
+                self.reg_pressure_num_warps = rng.choice(_REG_PRESSURE_NUM_WARPS)
+                self.reg_pressure_num_stages = rng.choice(_REG_PRESSURE_NUM_STAGES)
+                # Parallel accumulation chains (keep many regs live)
+                self.reg_pressure_parallel_chains = rng.choice(
+                    _REG_PRESSURE_CHAIN_COUNTS
+                )
+                # Disable block_ptr — its structured loads interact
+                # awkwardly with extreme block sizes
                 self.use_block_ptr = False
 
         # ── Divergent control flow (not in dot mode) ─────────────────
@@ -538,6 +588,7 @@ class KernelBuilder:
         if_else_inserted = False
         while_inserted = False
         nested_cf_inserted = False
+        parallel_chains_inserted = False
 
         while ops_emitted < self.num_body_ops:
             # Insert nested control flow roughly at 1/3 of body.
@@ -583,6 +634,21 @@ class KernelBuilder:
             ):
                 self._emit_loop()
                 loop_inserted = True
+                ops_emitted += 1
+                continue
+
+            # Parallel accumulation chains for register pressure stress.
+            # Placed at ~2/3 of body so many earlier variables are already
+            # live; the chains keep additional registers alive across a
+            # long code span.
+            if (
+                self.use_reg_pressure
+                and self.reg_pressure_parallel_chains > 0
+                and not parallel_chains_inserted
+                and ops_emitted >= (self.num_body_ops * 2) // 3
+            ):
+                self._emit_parallel_chains()
+                parallel_chains_inserted = True
                 ops_emitted += 1
                 continue
 
@@ -1157,6 +1223,65 @@ class KernelBuilder:
         out_dt = promote(src.dtype, operand.dtype)
         self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
         self._ops_used.append(f"loop_{accum_op}")
+
+    # ── Parallel accumulation chains (register-pressure stress) ──────────
+
+    def _emit_parallel_chains(self) -> None:
+        """Emit *N* independent computation chains whose results are
+        combined at the end.
+
+        Each chain picks a different starting variable and performs 2-4
+        element-wise ops, keeping its own set of temporaries live.
+        Because all chain outputs are combined in a final reduction,
+        the compiler cannot release any chain's registers until after
+        the merge — artificially maximising register pressure.
+
+        Pattern::
+
+            chain_0 = f(v_A)      # 2-4 ops
+            chain_1 = g(v_B)      # 2-4 ops, independent of chain_0
+            …
+            v_out = chain_0 + chain_1 + …
+        """
+        rng = self.rng
+        n_chains = self.reg_pressure_parallel_chains
+
+        chain_vars: list[TensorVar] = []
+        for chain_idx in range(n_chains):
+            # Pick a starting variable for this chain
+            start = self.symtab.pick_random(rng, is_block=True, shape=())
+            if start is None:
+                continue
+
+            chain_name = self.symtab.fresh_name("chain")
+            self._triton_body.append(f"{chain_name} = {start.name}")
+            self._torch_body.append(f"{chain_name} = {start.name}")
+            self.symtab.add(TensorVar(chain_name, start.dtype, is_block=True, shape=start.shape))
+
+            # Emit 2-4 ops building on this chain variable
+            ops_in_chain = rng.randint(2, 4)
+            for _ in range(ops_in_chain):
+                self._emit_one_op()
+
+            # The last emitted variable is this chain's output
+            last = self.symtab.last_var()
+            if last is not None:
+                chain_vars.append(last)
+
+        # Merge all chain outputs into a single variable so the compiler
+        # must keep every chain live until this point.
+        if len(chain_vars) >= 2:
+            merge_name = chain_vars[0].name
+            out_dt = chain_vars[0].dtype
+            for cv in chain_vars[1:]:
+                new_name = self.symtab.fresh_name("v")
+                self._triton_body.append(f"{new_name} = {merge_name} + {cv.name}")
+                self._torch_body.append(f"{new_name} = {merge_name} + {cv.name}")
+                out_dt = promote(out_dt, cv.dtype)
+                self.symtab.add(TensorVar(new_name, out_dt, is_block=True, shape=chain_vars[0].shape))
+                merge_name = new_name
+
+        self._ops_used.append("parallel_chains")
 
     # ── Scalar condition helpers (for if/else and while) ─────────────────
 
@@ -2074,7 +2199,13 @@ class KernelBuilder:
             "use_block_ptr": self.use_block_ptr,
             "use_gather": self.use_gather,
             "gather_data_inputs": self.gather_data_inputs if self.use_gather else 0,
+            # ── Register-pressure stress ─────────────────────────────
+            "use_reg_pressure": self.use_reg_pressure,
         }
+        if self.use_reg_pressure:
+            meta["reg_pressure_num_warps"] = self.reg_pressure_num_warps
+            meta["reg_pressure_num_stages"] = self.reg_pressure_num_stages
+            meta["reg_pressure_parallel_chains"] = self.reg_pressure_parallel_chains
         if self.use_atomic and self.atomic_op is not None:
             meta["atomic_op"] = self.atomic_op.name
             meta["output_init"] = self.atomic_op.output_init

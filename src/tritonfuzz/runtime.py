@@ -146,6 +146,8 @@ class Runtime:
             return self._allocate_dot_inputs(kernel)
         if meta.get("use_gather"):
             return self._allocate_gather_inputs(kernel)
+        if meta.get("use_pipeline_loop"):
+            return self._allocate_pipeline_inputs(kernel)
 
         n_elements = meta.get("n_elements", 1024)
         num_inputs = meta.get("num_inputs", 1)
@@ -212,6 +214,35 @@ class Runtime:
                 low = max(info.min, -127)
                 high = min(info.max, 127) + 1
                 t = torch.randint(low, high, (n_elements,), device=self._device, dtype=dt)
+
+            tensors.append(t)
+
+        return tensors
+
+    def _allocate_pipeline_inputs(self, kernel: GeneratedKernel) -> list[torch.Tensor]:
+        """Allocate larger tensors for a software-pipelining stress kernel.
+
+        Pipeline-loop kernels iterate ``trip`` times, each time loading a
+        BLOCK_SIZE chunk at a different stride.  The total tensor length
+        is ``pipeline_total_elements = trip * n_elements``.
+        """
+        meta = kernel.metadata
+        total = meta.get("pipeline_total_elements", meta.get("n_elements", 1024))
+        num_inputs = meta.get("num_inputs", 1)
+        dtype_strs: list[str] = meta.get("input_dtypes", ["torch.float32"] * num_inputs)
+
+        tensors: list[torch.Tensor] = []
+        for i in range(num_inputs):
+            dt_str = dtype_strs[i] if i < len(dtype_strs) else "torch.float32"
+            dt = _TORCH_DTYPE_MAP.get(dt_str, torch.float32)
+
+            if dt.is_floating_point:
+                t = torch.randn(total, device=self._device, dtype=dt)
+            else:
+                info = torch.iinfo(dt)
+                low = max(info.min, -127)
+                high = min(info.max, 127) + 1
+                t = torch.randint(low, high, (total,), device=self._device, dtype=dt)
 
             tensors.append(t)
 
@@ -291,6 +322,13 @@ class Runtime:
             num_stages = meta.get("reg_pressure_num_stages")
             if num_warps is not None:
                 launch_kwargs["num_warps"] = num_warps
+            if num_stages is not None:
+                launch_kwargs["num_stages"] = num_stages
+
+        # Pipeline-loop mode requests explicit num_stages to force
+        # the MLIR pipeliner into multi-buffering.
+        if meta.get("use_pipeline_loop"):
+            num_stages = meta.get("pipeline_loop_num_stages")
             if num_stages is not None:
                 launch_kwargs["num_stages"] = num_stages
 

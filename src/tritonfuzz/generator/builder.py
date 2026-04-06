@@ -123,6 +123,17 @@ _REG_PRESSURE_NUM_STAGES: list[int] = [1, 2, 3, 4, 5]
 # Parallel accumulation chain counts (all live simultaneously)
 _REG_PRESSURE_CHAIN_COUNTS: list[int] = [2, 3, 4]
 
+# ── Software-pipelining stress tunables ──────────────────────────────
+
+# Number of asynchronous tl.load calls inside the loop body.
+_PIPELINE_LOOP_LOADS: list[int] = [2, 3, 4]
+# Trip count range for the pipelining loop (higher → more buffering).
+_PIPELINE_LOOP_TRIP_RANGE: tuple[int, int] = (4, 16)
+# Element-wise ops between loads inside the loop body.
+_PIPELINE_LOOP_INNER_OPS: list[int] = [1, 2, 3]
+# num_stages pushed via metadata so the compiler uses multi-buffering.
+_PIPELINE_LOOP_NUM_STAGES: list[int] = [2, 3, 4, 5]
+
 
 class KernelBuilder:
     """Stateful builder that constructs exactly one kernel + reference pair.
@@ -198,6 +209,13 @@ class KernelBuilder:
         self.reg_pressure_num_warps: int = 4
         self.reg_pressure_num_stages: int = 2
         self.reg_pressure_parallel_chains: int = 0
+
+        # ── Software-pipelining stress loop ──────────────────────────────
+        self.use_pipeline_loop: bool = False
+        self.pipeline_loop_loads: int = 0
+        self.pipeline_loop_trip: int = 0
+        self.pipeline_loop_inner_ops: int = 0
+        self.pipeline_loop_num_stages: int = 2
 
         # ── State (accumulated during build) ─────────────────────────────
         self._triton_body: list[str] = []
@@ -357,6 +375,38 @@ class KernelBuilder:
                 # awkwardly with extreme block sizes
                 self.use_block_ptr = False
 
+        # ── Software-pipelining stress loop (12 % of NON-dot, NON-gather) ─
+        # Generates a for-loop with multiple tl.load calls, element-wise ops
+        # and accumulator updates in the body.  The MLIR pipeliner attempts
+        # to multi-buffer these loads; deeply complex bodies cause it to
+        # miscalculate dependencies, producing structural data races.
+        if not self.use_dot and not self.use_gather:
+            self.use_pipeline_loop = rng.random() > 0.88
+            if self.use_pipeline_loop:
+                self.pipeline_loop_loads = rng.choice(_PIPELINE_LOOP_LOADS)
+                self.pipeline_loop_trip = rng.randint(*_PIPELINE_LOOP_TRIP_RANGE)
+                self.pipeline_loop_inner_ops = rng.choice(_PIPELINE_LOOP_INNER_OPS)
+                self.pipeline_loop_num_stages = rng.choice(
+                    _PIPELINE_LOOP_NUM_STAGES
+                )
+                # Need enough inputs for the in-loop loads
+                self.num_inputs = max(self.num_inputs, self.pipeline_loop_loads)
+                while len(self.input_dtypes) < self.num_inputs:
+                    self.input_dtypes.append(pick_input_dtype(rng))
+                # Ensure all pipeline-loop inputs are float (loads → math)
+                for i in range(self.pipeline_loop_loads):
+                    if not self.input_dtypes[i].is_float:
+                        self.input_dtypes[i] = pick_float_dtype(rng)
+                # n_elements is the per-block tile; total tensor length is
+                # n_elements * trip_count (each iteration loads a new tile).
+                self.n_elements = rng.choice(N_ELEMENTS_CHOICES)
+                self.block_size = rng.choice(BLOCK_SIZE_CHOICES)
+                # Disable the simple for-loop — pipeline loop replaces it
+                self.insert_loop = False
+                self.loop_trip_count = 0
+                # Disable block_ptr (incompatible with strided pointer math)
+                self.use_block_ptr = False
+
         # ── Divergent control flow (not in dot mode) ─────────────────
         if not self.use_dot:
             # Nested control flow (10 %) — subsumes if/else and while
@@ -471,6 +521,8 @@ class KernelBuilder:
     def _emit_loads(self) -> None:
         if self.use_dot:
             return  # Dot loads are part of the K-loop in assembly
+        if self.use_pipeline_loop:
+            return  # Pipeline-loop loads happen inside the loop body
         if self.use_gather:
             self._emit_gather_loads()
             return
@@ -582,6 +634,13 @@ class KernelBuilder:
         if self.use_dot:
             self._emit_dot_body()
             return
+
+        # Pipeline-loop mode: the loop IS the body preamble—it creates
+        # initial variables that subsequent element-wise ops consume.
+        pipeline_loop_inserted = False
+        if self.use_pipeline_loop:
+            self._emit_pipeline_loop()
+            pipeline_loop_inserted = True
 
         ops_emitted = 0
         loop_inserted = False
@@ -1283,6 +1342,127 @@ class KernelBuilder:
 
         self._ops_used.append("parallel_chains")
 
+    # ── Software-pipelining stress loop ──────────────────────────────────
+
+    def _emit_pipeline_loop(self) -> None:
+        """Emit a ``for``-loop with multiple ``tl.load`` calls, element-wise
+        ops, and accumulator updates to stress the MLIR software pipeliner.
+
+        The pipeliner overlaps memory and compute via multi-buffering. A
+        complex loop body with interleaved loads and math forces it to
+        track many live buffers and compute dependencies simultaneously,
+        often miscalculating and producing structural data races.
+
+        **Triton pattern** (example with 3 loads)::
+
+            acc_0 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+            acc_1 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+            for _pipe_i in range(TRIP):
+                stride = _pipe_i * BLOCK_SIZE
+                ld_0 = tl.load(in_ptr0 + offsets + stride, mask=…)
+                ld_1 = tl.load(in_ptr1 + offsets + stride, mask=…)
+                ld_2 = tl.load(in_ptr2 + offsets + stride, mask=…)
+                t_0 = ld_0 * ld_1          # elementwise between loads
+                t_1 = tl.sin(ld_2)
+                acc_0 += t_0
+                acc_1 += t_1 + ld_1
+            v_out = acc_0 + acc_1
+
+        **PyTorch equivalent**::
+
+            x0_r = x0.reshape(TRIP, -1)
+            acc_0 = torch.zeros(n_elements)
+            for _pipe_i in range(TRIP):
+                ld_0 = x0_r[_pipe_i]
+                …
+        """
+        rng = self.rng
+        n_loads = self.pipeline_loop_loads
+        trip = self.pipeline_loop_trip
+        inner_ops = self.pipeline_loop_inner_ops
+        ind = "    "  # loop-body indent
+
+        # ── Accumulators (at least 2 to create cross-load dependencies) ──
+        n_accums = min(n_loads, 3)
+        acc_names: list[str] = []
+        for ai in range(n_accums):
+            aname = self.symtab.fresh_name("acc")
+            self._triton_body.append(
+                f"{aname} = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)"
+            )
+            self._torch_body.append(
+                f"{aname} = torch.zeros_like(x0_r[0])"
+            )
+            acc_names.append(aname)
+
+        # ── Loop header ──────────────────────────────────────────────────
+        self._triton_body.append(f"for _pipe_i in range({trip}):")
+        self._torch_body.append(f"for _pipe_i in range({trip}):")
+
+        # ── Stride variable ──────────────────────────────────────────────
+        self._triton_body.append(f"{ind}_pipe_stride = _pipe_i * BLOCK_SIZE")
+        # (torch ref uses reshaped indexing — no stride needed)
+
+        # ── Multiple tl.load calls ───────────────────────────────────────
+        mask_arg = ", mask=mask" if self.use_mask else ""
+        load_names: list[str] = []
+        for li in range(n_loads):
+            ld_name = self.symtab.fresh_name("ld")
+            other_val = ", other=0.0"
+            self._triton_body.append(
+                f"{ind}{ld_name} = tl.load(in_ptr{li} + offsets + _pipe_stride{mask_arg}{other_val})"
+            )
+            self._torch_body.append(
+                f"{ind}{ld_name} = x{li}_r[_pipe_i]"
+            )
+            dt = self.input_dtypes[li] if li < len(self.input_dtypes) else FLOAT32
+            self.symtab.add(TensorVar(ld_name, dt, is_block=True))
+            load_names.append(ld_name)
+            self._ops_used.append("pipeline_load")
+
+        # ── Element-wise ops between loads (interleaved compute) ─────────
+        inner_vars: list[str] = list(load_names)
+        for _ in range(inner_ops):
+            # Pick two of the available loop-local variables
+            a_name = rng.choice(inner_vars)
+            b_name = rng.choice(inner_vars)
+            op = rng.choice(["+", "*", "-"])
+            t_name = self.symtab.fresh_name("t")
+            self._triton_body.append(f"{ind}{t_name} = {a_name} {op} {b_name}")
+            self._torch_body.append(f"{ind}{t_name} = {a_name} {op} {b_name}")
+            self.symtab.add(TensorVar(t_name, FLOAT32, is_block=True))
+            inner_vars.append(t_name)
+
+        # ── Accumulator updates (multiple live accumulators) ─────────────
+        for ai, aname in enumerate(acc_names):
+            # Each accumulator is updated from a different combination
+            src_name = rng.choice(inner_vars)
+            accum_op = rng.choice(["+", "-"])
+            self._triton_body.append(
+                f"{ind}{aname} = {aname} {accum_op} {src_name}"
+            )
+            self._torch_body.append(
+                f"{ind}{aname} = {aname} {accum_op} {src_name}"
+            )
+
+        # ── Merge accumulators after the loop ────────────────────────────
+        if n_accums == 1:
+            merge_name = acc_names[0]
+        else:
+            merge_name = acc_names[0]
+            for aname in acc_names[1:]:
+                new_name = self.symtab.fresh_name("v")
+                self._triton_body.append(f"{new_name} = {merge_name} + {aname}")
+                self._torch_body.append(f"{new_name} = {merge_name} + {aname}")
+                self.symtab.add(TensorVar(new_name, FLOAT32, is_block=True))
+                merge_name = new_name
+
+        # Register the final merged variable
+        if merge_name == acc_names[0]:
+            self.symtab.add(TensorVar(merge_name, FLOAT32, is_block=True))
+
+        self._ops_used.append("pipeline_loop")
+
     # ── Scalar condition helpers (for if/else and while) ─────────────────
 
     def _make_scalar_condition(self) -> tuple[str, str]:
@@ -1789,6 +1969,8 @@ class KernelBuilder:
     def _assemble_triton_source(self) -> str:
         if self.use_dot:
             return self._assemble_dot_triton_source()
+        if self.use_pipeline_loop:
+            return self._assemble_pipeline_triton_source()
         if self.use_block_ptr:
             return self._assemble_block_ptr_triton_source()
         if self.use_gather:
@@ -1823,6 +2005,53 @@ class KernelBuilder:
             lines.append(f"    {line}")
 
         # ── Standard epilogue (§4.1.1) ───────────────────────────────────
+        if self.use_atomic and self.atomic_op is not None:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(
+                f"    {self.atomic_op.triton_fn}(out_ptr + offsets, {out_var}{mask_arg})"
+            )
+        else:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(f"    tl.store(out_ptr + offsets, {out_var}{mask_arg})")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_pipeline_triton_source(self) -> str:
+        """Assemble a kernel whose body contains a software-pipelining
+        stress loop with multiple ``tl.load`` calls per iteration.
+
+        The kernel uses a standard 1-D grid.  Each input pointer covers
+        ``n_elements * trip`` floats; the loop iterates ``trip`` times,
+        each time loading from ``ptr + offsets + i * BLOCK_SIZE``.
+        """
+        seed = self.seed
+        out_var = self._output_var.name if self._output_var else "v_0"
+        ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            f"    {ptr_args}, out_ptr,",
+            "    n_elements,",
+            "    BLOCK_SIZE: tl.constexpr,",
+            "):",
+            "    pid = tl.program_id(axis=0)",
+            "    block_start = pid * BLOCK_SIZE",
+            "    offsets = block_start + tl.arange(0, BLOCK_SIZE)",
+        ]
+
+        if self.use_mask:
+            lines.append("    mask = offsets < n_elements")
+
+        # Body (pipeline loop + post-ops emitted by _emit_body)
+        for line in self._triton_body:
+            lines.append(f"    {line}")
+
+        # Store epilogue
         if self.use_atomic and self.atomic_op is not None:
             mask_arg = ", mask=mask" if self.use_mask else ""
             lines.append(
@@ -2069,6 +2298,8 @@ class KernelBuilder:
     def _assemble_torch_ref_source(self) -> str:
         if self.use_dot:
             return self._assemble_dot_torch_ref_source()
+        if self.use_pipeline_loop:
+            return self._assemble_pipeline_torch_ref_source()
 
         seed = self.seed
         out_var = self._output_var.name if self._output_var else "v_0"
@@ -2090,6 +2321,36 @@ class KernelBuilder:
 
         # For gather mode, the torch ref needs to slice data tensors
         # using the index.  The _torch_body already uses x_idx and x1[idx_0].
+        for line in self._torch_body:
+            lines.append(f"    {line}")
+
+        lines.append(f"    return {out_var}")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_pipeline_torch_ref_source(self) -> str:
+        """Assemble PyTorch reference for a pipeline-loop kernel.
+
+        Each input tensor has shape ``(trip * n_elements,)`` and is
+        reshaped to ``(trip, n_elements)`` so the loop body can index
+        with ``x_i_r[_pipe_i]`` per iteration.
+        """
+        seed = self.seed
+        out_var = self._output_var.name if self._output_var else "v_0"
+        trip = self.pipeline_loop_trip
+        input_args = ", ".join(f"x{i}" for i in range(self.num_inputs))
+
+        lines: list[str] = [
+            "import torch",
+            "",
+            "",
+            f"def torch_ref_seed_{seed}({input_args}):",
+        ]
+
+        # Reshape each input to (trip, n_elements) for strided access
+        for i in range(self.num_inputs):
+            lines.append(f"    x{i}_r = x{i}.reshape({trip}, -1)")
+
         for line in self._torch_body:
             lines.append(f"    {line}")
 
@@ -2201,7 +2462,18 @@ class KernelBuilder:
             "gather_data_inputs": self.gather_data_inputs if self.use_gather else 0,
             # ── Register-pressure stress ─────────────────────────────
             "use_reg_pressure": self.use_reg_pressure,
+            # ── Software-pipelining stress ────────────────────────────
+            "use_pipeline_loop": self.use_pipeline_loop,
         }
+        if self.use_pipeline_loop:
+            meta["pipeline_loop_loads"] = self.pipeline_loop_loads
+            meta["pipeline_loop_trip"] = self.pipeline_loop_trip
+            meta["pipeline_loop_inner_ops"] = self.pipeline_loop_inner_ops
+            meta["pipeline_loop_num_stages"] = self.pipeline_loop_num_stages
+            # Total elements per input tensor (trip * n_elements)
+            meta["pipeline_total_elements"] = (
+                self.pipeline_loop_trip * self.n_elements
+            )
         if self.use_reg_pressure:
             meta["reg_pressure_num_warps"] = self.reg_pressure_num_warps
             meta["reg_pressure_num_stages"] = self.reg_pressure_num_stages

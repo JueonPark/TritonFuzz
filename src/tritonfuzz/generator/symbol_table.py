@@ -159,9 +159,16 @@ class SymbolTable:
         }
 
     def restore(self, snap: dict) -> None:
-        """Restore a previously captured snapshot."""
+        """Restore a previously captured snapshot.
+
+        The name counter is **not** rolled back so that the next branch
+        generates fresh variable names, avoiding name collisions between
+        if/else branches that Triton's SSA builder would interpret as
+        phi-nodes requiring matching types.
+        """
         self._vars = dict(snap["vars"])
-        self._counter = snap["counter"]
+        # Intentionally keep self._counter at its current (advanced) value
+        # so that the next branch generates distinct variable names.
         self._order = list(snap["order"])
 
     def pick_random_by_ndim(

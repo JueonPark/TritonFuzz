@@ -79,14 +79,25 @@ def pick_float_dtype(rng: random.Random) -> DType:
 
 
 def promote(a: DType, b: DType) -> DType:
-    """Return the 'wider' type, following Triton / PyTorch implicit rules.
+    """Return the 'wider' type, following Triton's implicit promotion rules.
 
-    * Float always wins over int.
-    * Among same kind, larger ``bits`` wins.
+    When mixing float and int, Triton first converts the integer to
+    a standard float of at least the same bit-width (e.g. int32→float32),
+    then picks the wider float.  This means ``promote(bf16, int32)``
+    returns **float32**, not bf16.
+
+    Among same kind, larger ``bits`` wins.
     """
-    if a.is_float and not b.is_float:
-        return a
-    if b.is_float and not a.is_float:
-        return b
-    # Same kind → wider bits wins
-    return a if a.bits >= b.bits else b
+    if a.is_float and b.is_float:
+        return a if a.bits >= b.bits else b
+    if a.is_int and b.is_int:
+        return a if a.bits >= b.bits else b
+
+    # Mixed float/int: convert the int to its natural float width,
+    # then promote between the two floats.
+    if a.is_float and b.is_int:
+        int_as_float_bits = max(b.bits, 32)  # int32→fp32, int64→fp64
+        return a if a.bits >= int_as_float_bits else FLOAT32 if int_as_float_bits == 32 else FLOAT64
+    # b.is_float and a.is_int
+    int_as_float_bits = max(a.bits, 32)
+    return b if b.bits >= int_as_float_bits else FLOAT32 if int_as_float_bits == 32 else FLOAT64

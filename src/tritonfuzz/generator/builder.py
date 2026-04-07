@@ -1593,19 +1593,20 @@ class KernelBuilder:
             false_dtype = fb.dtype if fb else FLOAT32
             false_shape = fb.shape if fb else ()
 
-        # ── Reconcile dtypes: insert casts so both branches produce
-        #    the same type for the SSA phi-node ────────────────────────
+        # ── Reconcile dtypes: always cast in both branches so the
+        #    SSA phi-node has a consistent type.  Unconditional casts
+        #    are needed because Triton's type inference may promote
+        #    intermediates (e.g. tl.sum(bf16)->fp32) in ways that our
+        #    dtype model does not track. ───────────────────────────────
         out_dt = promote(true_dtype, false_dtype)
 
-        if true_dtype != out_dt:
-            # Insert cast at the end of the true branch (before the else)
-            self._triton_body.insert(true_cast_idx, f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.insert(true_cast_idx_torch, f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
+        # Cast at the end of the true branch (before the else)
+        self._triton_body.insert(true_cast_idx, f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.insert(true_cast_idx_torch, f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
 
-        if false_dtype != out_dt:
-            # Append cast at the end of the false branch
-            self._triton_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
+        # Cast at the end of the false branch
+        self._triton_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
 
         # ── Restore and register unified output ──────────────────────
         self.symtab.restore(snap)
@@ -1807,22 +1808,23 @@ class KernelBuilder:
         # ── Reconcile dtypes across all three paths ──────────────────
         out_dt = promote(promote(inner_true_dtype, inner_false_dtype), outer_false_dtype)
 
-        # Insert casts in reverse index order so earlier inserts don't
-        # shift later indices.
-        if outer_false_dtype != out_dt:
-            self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
+        # Always insert casts in all branches to ensure the SSA
+        # phi-node has a consistent type, even when our dtype model
+        # agrees (Triton's inference may differ due to implicit
+        # promotions like tl.sum(bf16)->fp32).
+        # Insert in reverse index order so earlier inserts don't shift
+        # later indices.
+        self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
 
-        if inner_false_dtype != out_dt:
-            self._triton_body.insert(inner_false_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.insert(inner_false_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
-            # Shift inner_true index since we inserted above it
-            inner_true_cast_idx += 1
-            inner_true_cast_idx_torch += 1
+        self._triton_body.insert(inner_false_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.insert(inner_false_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
+        # Shift inner_true index since we inserted above it
+        inner_true_cast_idx += 1
+        inner_true_cast_idx_torch += 1
 
-        if inner_true_dtype != out_dt:
-            self._triton_body.insert(inner_true_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.insert(inner_true_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
+        self._triton_body.insert(inner_true_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.insert(inner_true_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
 
         # ── Register unified output ──────────────────────────────────
         self.symtab.restore(snap)
@@ -2043,13 +2045,13 @@ class KernelBuilder:
         # ── Reconcile dtypes between if and else branches ────────────
         out_dt = promote(true_dtype, false_dtype)
 
-        if true_dtype != out_dt:
-            self._triton_body.insert(true_cast_idx, f"    {_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.insert(true_cast_idx_torch, f"    {_cast_line(out_name, out_dt, framework='torch')}")
+        # Always cast in both branches to guarantee the SSA phi-node
+        # has a consistent type.
+        self._triton_body.insert(true_cast_idx, f"    {_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.insert(true_cast_idx_torch, f"    {_cast_line(out_name, out_dt, framework='torch')}")
 
-        if false_dtype != out_dt:
-            self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
-            self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
+        self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
+        self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
 
         # ── Register unified output ──────────────────────────────────
         self.symtab.restore(snap)

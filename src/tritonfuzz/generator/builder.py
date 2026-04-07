@@ -57,6 +57,15 @@ N_ELEMENTS_CHOICES: list[int] = [512, 1024, 2048, 4096, 8192]
 # Accumulation operators used inside generated ``for`` loops.
 _LOOP_ACCUM_OPS: list[str] = ["+", "*", "-"]
 
+
+def _cast_line(var_name: str, target_dtype: DType, *, framework: str) -> str:
+    """Return a ``var = var.to(dtype)`` statement string.
+
+    *framework* is ``"triton"`` or ``"torch"``.
+    """
+    dt_str = target_dtype.triton if framework == "triton" else target_dtype.torch
+    return f"{var_name} = {var_name}.to({dt_str})"
+
 # ── Scalar-condition tunables (for if/else and while) ────────────────────
 
 # Reduction functions used to derive scalar conditions from block tensors.
@@ -1252,6 +1261,11 @@ class KernelBuilder:
 
         This exercises loop-invariant code motion (LICM) and software
         pipelining in the Triton compiler.
+
+        If the accumulation operation would promote the dtype (e.g.
+        ``bf16 + fp32 → fp32``), an explicit cast back to the initial
+        dtype is emitted so the loop-carried variable's type stays
+        consistent across iterations.
         """
         rng = self.rng
         src = self.symtab.pick_random(rng)
@@ -1262,6 +1276,10 @@ class KernelBuilder:
         acc_name = self.symtab.fresh_name("v")
         accum_op = rng.choice(_LOOP_ACCUM_OPS)
         trip = self.loop_trip_count
+
+        # Determine if the accumulation changes the dtype
+        promoted_dt = promote(src.dtype, operand.dtype)
+        needs_cast = promoted_dt != src.dtype
 
         # Initialise accumulator
         self._triton_body.append(f"{acc_name} = {src.name}")
@@ -1279,8 +1297,12 @@ class KernelBuilder:
             f"    {acc_name} = {acc_name} {accum_op} {operand.name}"
         )
 
-        out_dt = promote(src.dtype, operand.dtype)
-        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
+        # Cast back to initial dtype to keep loop-carried type consistent
+        if needs_cast:
+            self._triton_body.append(f"    {_cast_line(acc_name, src.dtype, framework='triton')}")
+            self._torch_body.append(f"    {_cast_line(acc_name, src.dtype, framework='torch')}")
+
+        self.symtab.add(TensorVar(acc_name, src.dtype, is_block=True, shape=src.shape))
         self._ops_used.append(f"loop_{accum_op}")
 
     # ── Parallel accumulation chains (register-pressure stress) ──────────
@@ -1506,7 +1528,9 @@ class KernelBuilder:
                 v_N = tl.sin(v_B)
 
         Both branches write to the **same output variable** so the
-        post-branch symbol table stays consistent.
+        post-branch symbol table stays consistent.  Explicit casts are
+        inserted when the branches produce different dtypes so that the
+        SSA phi-node has a consistent type.
         """
         rng = self.rng
         triton_cond, torch_cond = self._make_scalar_condition()
@@ -1523,26 +1547,26 @@ class KernelBuilder:
         self._torch_body.append(f"{indent}if {torch_cond}:")
 
         # ── True branch ──────────────────────────────────────────────
-        true_triton_start = len(self._triton_body)
-        true_torch_start = len(self._torch_body)
         for _ in range(self.if_else_branch_ops):
             self._emit_one_op(indent=inner)
         true_last = self.symtab.last_var()
 
-        # Assign to unified output
+        # Assign to unified output (cast placeholder inserted below)
         if true_last is not None:
             self._triton_body.append(f"{inner}{out_name} = {true_last.name}")
             self._torch_body.append(f"{inner}{out_name} = {true_last.name}")
             true_dtype = true_last.dtype
             true_shape = true_last.shape
         else:
-            # Branch produced nothing — fallback to an existing var
             fb = self.symtab.pick_random(rng)
             fb_name = fb.name if fb else "0.0"
             self._triton_body.append(f"{inner}{out_name} = {fb_name}")
             self._torch_body.append(f"{inner}{out_name} = {fb_name}")
             true_dtype = fb.dtype if fb else FLOAT32
             true_shape = fb.shape if fb else ()
+        # Mark where a reconciliation cast will be appended for this branch
+        true_cast_idx = len(self._triton_body)
+        true_cast_idx_torch = len(self._torch_body)
 
         # ── Restore for false branch ─────────────────────────────────
         self.symtab.restore(snap)
@@ -1569,9 +1593,22 @@ class KernelBuilder:
             false_dtype = fb.dtype if fb else FLOAT32
             false_shape = fb.shape if fb else ()
 
+        # ── Reconcile dtypes: insert casts so both branches produce
+        #    the same type for the SSA phi-node ────────────────────────
+        out_dt = promote(true_dtype, false_dtype)
+
+        if true_dtype != out_dt:
+            # Insert cast at the end of the true branch (before the else)
+            self._triton_body.insert(true_cast_idx, f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.insert(true_cast_idx_torch, f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
+
+        if false_dtype != out_dt:
+            # Append cast at the end of the false branch
+            self._triton_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.append(f"{inner}{_cast_line(out_name, out_dt, framework='torch')}")
+
         # ── Restore and register unified output ──────────────────────
         self.symtab.restore(snap)
-        out_dt = promote(true_dtype, false_dtype)
         self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=true_shape))
         self._ops_used.append("if_else")
 
@@ -1632,11 +1669,17 @@ class KernelBuilder:
         self._torch_body.append(
             f"{inner}{acc_name} = {acc_name} {accum_op} {operand.name}"
         )
+
+        # Cast back to initial dtype to keep loop-carried type consistent
+        promoted_dt = promote(src.dtype, operand.dtype)
+        if promoted_dt != src.dtype:
+            self._triton_body.append(f"{inner}{_cast_line(acc_name, src.dtype, framework='triton')}")
+            self._torch_body.append(f"{inner}{_cast_line(acc_name, src.dtype, framework='torch')}")
+
         self._triton_body.append(f"{inner}{counter_name} += 1")
         self._torch_body.append(f"{inner}{counter_name} += 1")
 
-        out_dt = promote(src.dtype, operand.dtype)
-        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
+        self.symtab.add(TensorVar(acc_name, src.dtype, is_block=True, shape=src.shape))
         self._ops_used.append("while_loop")
 
     # ── Nested control-flow emission ─────────────────────────────────────
@@ -1680,6 +1723,9 @@ class KernelBuilder:
                     v_N = <op_b>(v_X)
             else:
                 v_N = <op_c>(v_X)
+
+        Explicit casts are inserted so that all three paths produce the
+        same dtype for the unified output variable.
         """
         rng = self.rng
         triton_cond_outer, torch_cond_outer = self._make_scalar_condition()
@@ -1711,6 +1757,9 @@ class KernelBuilder:
             self._triton_body.append(f"        {out_name} = {fb_name}")
             self._torch_body.append(f"        {out_name} = {fb_name}")
             inner_true_dtype = fb.dtype if fb else FLOAT32
+        # Mark position for reconciliation cast
+        inner_true_cast_idx = len(self._triton_body)
+        inner_true_cast_idx_torch = len(self._torch_body)
 
         # Restore for inner else
         self.symtab.restore(inner_snap)
@@ -1731,6 +1780,9 @@ class KernelBuilder:
             self._triton_body.append(f"        {out_name} = {fb_name}")
             self._torch_body.append(f"        {out_name} = {fb_name}")
             inner_false_dtype = fb.dtype if fb else FLOAT32
+        # Mark position for reconciliation cast
+        inner_false_cast_idx = len(self._triton_body)
+        inner_false_cast_idx_torch = len(self._torch_body)
 
         # ── Outer ELSE ───────────────────────────────────────────────
         self.symtab.restore(snap)
@@ -1752,9 +1804,28 @@ class KernelBuilder:
             self._torch_body.append(f"    {out_name} = {fb_name}")
             outer_false_dtype = fb.dtype if fb else FLOAT32
 
+        # ── Reconcile dtypes across all three paths ──────────────────
+        out_dt = promote(promote(inner_true_dtype, inner_false_dtype), outer_false_dtype)
+
+        # Insert casts in reverse index order so earlier inserts don't
+        # shift later indices.
+        if outer_false_dtype != out_dt:
+            self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
+
+        if inner_false_dtype != out_dt:
+            self._triton_body.insert(inner_false_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.insert(inner_false_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
+            # Shift inner_true index since we inserted above it
+            inner_true_cast_idx += 1
+            inner_true_cast_idx_torch += 1
+
+        if inner_true_dtype != out_dt:
+            self._triton_body.insert(inner_true_cast_idx, f"        {_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.insert(inner_true_cast_idx_torch, f"        {_cast_line(out_name, out_dt, framework='torch')}")
+
         # ── Register unified output ──────────────────────────────────
         self.symtab.restore(snap)
-        out_dt = promote(promote(inner_true_dtype, inner_false_dtype), outer_false_dtype)
         src_for_shape = self.symtab.pick_random(rng, is_block=True, shape=())
         shape = src_for_shape.shape if src_for_shape else ()
         self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=shape))
@@ -1817,7 +1888,8 @@ class KernelBuilder:
         self._triton_body.append(f"while {triton_cond}:")
         self._torch_body.append(f"while {torch_cond}:")
 
-        # Inner if/else
+        # Inner if/else — both branches must produce src.dtype to keep
+        # the loop-carried variable type consistent.
         triton_inner_cond = f"{triton_inner_red.format(acc_name)} {inner_cmp} {inner_threshold}"
         torch_inner_cond = f"{torch_inner_red.format(acc_name)} {inner_cmp} {inner_threshold}"
         self._triton_body.append(f"    if {triton_inner_cond}:")
@@ -1829,6 +1901,11 @@ class KernelBuilder:
         self._torch_body.append(
             f"        {acc_name} = {acc_name} {accum_op_true} {op1.name}"
         )
+        # Cast back if promotion changed the dtype
+        true_dt = promote(src.dtype, op1.dtype)
+        if true_dt != src.dtype:
+            self._triton_body.append(f"        {_cast_line(acc_name, src.dtype, framework='triton')}")
+            self._torch_body.append(f"        {_cast_line(acc_name, src.dtype, framework='torch')}")
 
         self._triton_body.append("    else:")
         self._torch_body.append("    else:")
@@ -1839,13 +1916,17 @@ class KernelBuilder:
         self._torch_body.append(
             f"        {acc_name} = {acc_name} {accum_op_false} {op2.name}"
         )
+        # Cast back if promotion changed the dtype
+        false_dt = promote(src.dtype, op2.dtype)
+        if false_dt != src.dtype:
+            self._triton_body.append(f"        {_cast_line(acc_name, src.dtype, framework='triton')}")
+            self._torch_body.append(f"        {_cast_line(acc_name, src.dtype, framework='torch')}")
 
         # Counter increment
         self._triton_body.append(f"    {counter_name} += 1")
         self._torch_body.append(f"    {counter_name} += 1")
 
-        out_dt = promote(promote(src.dtype, op1.dtype), op2.dtype)
-        self.symtab.add(TensorVar(acc_name, out_dt, is_block=True, shape=src.shape))
+        self.symtab.add(TensorVar(acc_name, src.dtype, is_block=True, shape=src.shape))
         self._ops_used.append("loop_with_branch")
 
     def _emit_while_in_if(self) -> None:
@@ -1921,11 +2002,21 @@ class KernelBuilder:
             self._torch_body.append(
                 f"        {out_name} = {out_name} {accum_op} {operand.name}"
             )
+
+            # Cast back to src dtype inside loop to keep loop-carried type consistent
+            loop_promoted = promote(src.dtype, operand.dtype)
+            if loop_promoted != src.dtype:
+                self._triton_body.append(f"        {_cast_line(out_name, src.dtype, framework='triton')}")
+                self._torch_body.append(f"        {_cast_line(out_name, src.dtype, framework='torch')}")
+
             self._triton_body.append(f"        {counter_name} += 1")
             self._torch_body.append(f"        {counter_name} += 1")
 
-            true_dtype = promote(src.dtype, operand.dtype)
+            true_dtype = src.dtype
             true_shape = src.shape
+        # Mark position for reconciliation cast in true branch
+        true_cast_idx = len(self._triton_body)
+        true_cast_idx_torch = len(self._torch_body)
 
         # ── ELSE branch ──────────────────────────────────────────────
         self.symtab.restore(snap)
@@ -1949,9 +2040,19 @@ class KernelBuilder:
             false_dtype = fb.dtype if fb else FLOAT32
             false_shape = fb.shape if fb else ()
 
+        # ── Reconcile dtypes between if and else branches ────────────
+        out_dt = promote(true_dtype, false_dtype)
+
+        if true_dtype != out_dt:
+            self._triton_body.insert(true_cast_idx, f"    {_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.insert(true_cast_idx_torch, f"    {_cast_line(out_name, out_dt, framework='torch')}")
+
+        if false_dtype != out_dt:
+            self._triton_body.append(f"    {_cast_line(out_name, out_dt, framework='triton')}")
+            self._torch_body.append(f"    {_cast_line(out_name, out_dt, framework='torch')}")
+
         # ── Register unified output ──────────────────────────────────
         self.symtab.restore(snap)
-        out_dt = promote(true_dtype, false_dtype)
         self.symtab.add(TensorVar(out_name, out_dt, is_block=True, shape=true_shape))
         self._ops_used.append("while_in_if")
 

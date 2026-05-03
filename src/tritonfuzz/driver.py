@@ -188,7 +188,10 @@ class CompilerDriver:
         num_inputs = kernel.metadata.get("num_inputs", 1)
         input_dtypes = kernel.metadata.get("input_dtypes")
         output_dtype = kernel.metadata.get("output_dtype")
-        sig = self._build_signature(jit_fn, num_inputs, input_dtypes, output_dtype)
+        sig = self._build_signature(
+            jit_fn, num_inputs, input_dtypes, output_dtype,
+            metadata=kernel.metadata,
+        )
 
         # ── Step 4: build constexprs for tl.constexpr parameters ─────────
         constexprs = self._build_constexprs(kernel, jit_fn)
@@ -238,10 +241,12 @@ class CompilerDriver:
         num_inputs: int,
         input_dtypes: list[str] | None = None,
         output_dtype: str | None = None,
+        metadata: dict | None = None,
     ) -> dict[str, str]:
         """Build the positional-argument signature dict for ``triton.compile``.
 
-        Layout: ``in_ptr0, in_ptr1, …, out_ptr, n_elements`` (constexprs excluded).
+        Layout: ``in_ptr0, in_ptr1, …, [scatter_idx_ptr,] out_ptr, n_elements``
+        (constexprs excluded).
         Keys are parameter *names* (strings), matching the current Triton API.
         Parameters marked ``tl.constexpr`` are excluded from the signature.
 
@@ -257,6 +262,9 @@ class CompilerDriver:
             ``"*fp32"``.
         output_dtype:
             PyTorch dtype string for the output pointer. Defaults to ``"*fp32"``.
+        metadata:
+            Kernel metadata dict.  Used to detect scatter-only mode which
+            inserts an extra ``scatter_idx_ptr`` before ``out_ptr``.
         """
         # Collect non-constexpr parameter names from the JIT function.
         import triton.language as tl
@@ -280,6 +288,12 @@ class CompilerDriver:
             )
             name = non_constexpr_names[pos] if pos < len(non_constexpr_names) else f"arg{pos}"
             sig[name] = cls._TORCH_DTYPE_TO_SIG.get(dt_str, "*fp32")
+            pos += 1
+        # scatter_idx_ptr (scatter-only mode: extra i32 pointer before out_ptr)
+        _meta = metadata or {}
+        if _meta.get("use_scatter") and not _meta.get("use_gather"):
+            name = non_constexpr_names[pos] if pos < len(non_constexpr_names) else f"arg{pos}"
+            sig[name] = "*i32"
             pos += 1
         # out_ptr
         out_sig = cls._TORCH_DTYPE_TO_SIG.get(output_dtype or "", "*fp32")

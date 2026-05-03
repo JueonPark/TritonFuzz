@@ -213,6 +213,10 @@ class KernelBuilder:
         self.use_gather: bool = False
         self.gather_data_inputs: int = 0  # how many data inputs use gather
 
+        # ── Scatter mode (indirect stores via tl.store(ptr + idx)) ───
+        self.use_scatter: bool = False
+        self.scatter_unique_indices: bool = True  # True = permutation (deterministic)
+
         # ── Register-pressure stress mode ────────────────────────────────
         self.use_reg_pressure: bool = False
         self.reg_pressure_num_warps: int = 4
@@ -351,6 +355,24 @@ class KernelBuilder:
                     self.input_dtypes.append(pick_input_dtype(rng))
                 # Disable block_ptr if gather is on — they are different
                 # pointer strategies on the load side
+                self.use_block_ptr = False
+
+        # Scatter mode (12 % of NON-dot, NON-block_ptr kernels)
+        # Uses tl.store(out_ptr + idx, value) instead of contiguous
+        # tl.store(out_ptr + offsets, value), exercising unstructured
+        # scatter instruction generation.  Can coexist with gather
+        # (shared index tensor) or be standalone.
+        if not self.use_dot and not self.use_block_ptr:
+            self.use_scatter = rng.random() > 0.88
+            if self.use_scatter:
+                # Decide index uniqueness: unique (permutation) is
+                # deterministic; non-unique may have write races.
+                self.scatter_unique_indices = rng.random() > 0.40  # 60 % unique
+                if not self.use_gather:
+                    # Scatter-only: keep n_elements reasonable
+                    self.n_elements = rng.choice(_GATHER_N_ELEMENTS_CHOICES)
+                # Disable block_ptr — scattered stores are incompatible
+                # with structured block-pointer stores
                 self.use_block_ptr = False
 
         # ── Register-pressure stress (15 % of NON-dot kernels) ──────
@@ -535,6 +557,9 @@ class KernelBuilder:
         if self.use_gather:
             self._emit_gather_loads()
             return
+        if self.use_scatter and not self.use_gather:
+            self._emit_scatter_only_loads()
+            return
         if self.use_block_ptr:
             self._emit_block_ptr_loads()
             return
@@ -634,6 +659,53 @@ class KernelBuilder:
             self.symtab.add(TensorVar(var_name, dt, is_block=True))
 
         self._ops_used.append("gather_load")
+        if self.use_scatter:
+            self._ops_used.append("scatter_store")
+
+    def _emit_scatter_only_loads(self) -> None:
+        """Emit standard contiguous loads plus a scatter index load.
+
+        When scatter is active WITHOUT gather, data inputs are loaded
+        contiguously (standard path) and a separate scatter index
+        tensor is loaded.  The index is used only in the store
+        epilogue: ``tl.store(out_ptr + scatter_idx, value)``.
+
+        Pattern::
+
+            scatter_idx = tl.load(scatter_idx_ptr + offsets, mask=mask)
+            v_0 = tl.load(in_ptr0 + offsets, mask=mask)
+            v_1 = tl.load(in_ptr1 + offsets, mask=mask)
+        """
+        mask_arg = ", mask=mask" if self.use_mask else ""
+        other_arg_int = ", other=0" if self.use_mask else ""
+
+        # Load the scatter index tensor
+        self._triton_body.append(
+            f"scatter_idx = tl.load(scatter_idx_ptr + offsets{mask_arg}{other_arg_int})"
+        )
+        self._torch_body.append(
+            "scatter_idx = x_scatter_idx"
+        )
+
+        # Load data inputs contiguously (standard path)
+        for i in range(self.num_inputs):
+            var_name = self.symtab.fresh_name("v")
+            dt = self.input_dtypes[i]
+            ptr = f"in_ptr{i}"
+
+            mask_arg_data = ", mask=mask" if self.use_mask else ""
+            other_arg_data = ""
+            if self.use_mask and self.mask_use_other:
+                other_val = "0.0" if dt.is_float else "0"
+                other_arg_data = f", other={other_val}"
+            triton_line = f"{var_name} = tl.load({ptr} + offsets{mask_arg_data}{other_arg_data})"
+            torch_line = f"{var_name} = x{i}"
+
+            self._triton_body.append(triton_line)
+            self._torch_body.append(torch_line)
+            self.symtab.add(TensorVar(var_name, dt, is_block=True))
+
+        self._ops_used.append("scatter_store")
 
     # ================================================================== #
     #  Phase 3 – Emit body ops (§4.2 Tensor Graph Synthesis)               #
@@ -2078,6 +2150,8 @@ class KernelBuilder:
             return self._assemble_block_ptr_triton_source()
         if self.use_gather:
             return self._assemble_gather_triton_source()
+        if self.use_scatter:
+            return self._assemble_scatter_triton_source()
 
         seed = self.seed
         ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
@@ -2264,15 +2338,63 @@ class KernelBuilder:
         for line in self._triton_body:
             lines.append(f"    {line}")
 
-        # Store epilogue
+        # Store epilogue — use scatter (indirect) indexing if enabled
+        store_offset = "idx_0" if self.use_scatter else "offsets"
         if self.use_atomic and self.atomic_op is not None:
             mask_arg = ", mask=mask" if self.use_mask else ""
             lines.append(
-                f"    {self.atomic_op.triton_fn}(out_ptr + offsets, {out_var}{mask_arg})"
+                f"    {self.atomic_op.triton_fn}(out_ptr + {store_offset}, {out_var}{mask_arg})"
             )
         else:
             mask_arg = ", mask=mask" if self.use_mask else ""
-            lines.append(f"    tl.store(out_ptr + offsets, {out_var}{mask_arg})")
+            lines.append(f"    tl.store(out_ptr + {store_offset}, {out_var}{mask_arg})")
+
+        return "\n".join(lines) + "\n"
+
+    def _assemble_scatter_triton_source(self) -> str:
+        """Assemble a kernel with indirect (scatter) stores.
+
+        Data inputs are loaded contiguously; a separate scatter index
+        tensor drives the store epilogue:
+        ``tl.store(out_ptr + scatter_idx, value)``.
+        """
+        seed = self.seed
+        out_var = self._output_var.name if self._output_var else "v_0"
+
+        ptr_args = ", ".join(f"in_ptr{i}" for i in range(self.num_inputs))
+
+        lines: list[str] = [
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def triton_kernel_seed_{seed}(",
+            f"    {ptr_args}, scatter_idx_ptr, out_ptr,",
+            "    n_elements,",
+            "    BLOCK_SIZE: tl.constexpr,",
+            "):",
+            "    pid = tl.program_id(axis=0)",
+            "    block_start = pid * BLOCK_SIZE",
+            "    offsets = block_start + tl.arange(0, BLOCK_SIZE)",
+        ]
+
+        if self.use_mask:
+            lines.append("    mask = offsets < n_elements")
+
+        # Body (includes scatter index load + data loads + ops)
+        for line in self._triton_body:
+            lines.append(f"    {line}")
+
+        # Store epilogue — indirect via scatter_idx
+        if self.use_atomic and self.atomic_op is not None:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(
+                f"    {self.atomic_op.triton_fn}(out_ptr + scatter_idx, {out_var}{mask_arg})"
+            )
+        else:
+            mask_arg = ", mask=mask" if self.use_mask else ""
+            lines.append(f"    tl.store(out_ptr + scatter_idx, {out_var}{mask_arg})")
 
         return "\n".join(lines) + "\n"
 
@@ -2412,6 +2534,10 @@ class KernelBuilder:
             # First arg is the index tensor, then data tensors
             args = ["x_idx"] + [f"x{i}" for i in range(1, self.num_inputs)]
             input_args = ", ".join(args)
+        elif self.use_scatter:
+            # Scatter-only: data tensors + scatter index
+            args = [f"x{i}" for i in range(self.num_inputs)] + ["x_scatter_idx"]
+            input_args = ", ".join(args)
         else:
             input_args = ", ".join(f"x{i}" for i in range(self.num_inputs))
 
@@ -2427,7 +2553,22 @@ class KernelBuilder:
         for line in self._torch_body:
             lines.append(f"    {line}")
 
-        lines.append(f"    return {out_var}")
+        # Scatter mode: write to output via indexed assignment instead
+        # of returning the computed value directly.
+        if self.use_scatter:
+            # Determine scatter index variable name
+            if self.use_gather:
+                scatter_idx_var = "x_idx"  # shared with gather
+            else:
+                scatter_idx_var = "x_scatter_idx"
+            output_dtype_str = (
+                self._output_var.dtype.torch if self._output_var else "torch.float32"
+            )
+            lines.append(f"    _out = torch.zeros({scatter_idx_var}.shape[0], dtype={output_dtype_str}, device={out_var}.device)")
+            lines.append(f"    _out[{scatter_idx_var}] = {out_var}")
+            lines.append("    return _out")
+        else:
+            lines.append(f"    return {out_var}")
 
         return "\n".join(lines) + "\n"
 
@@ -2563,6 +2704,9 @@ class KernelBuilder:
             "use_block_ptr": self.use_block_ptr,
             "use_gather": self.use_gather,
             "gather_data_inputs": self.gather_data_inputs if self.use_gather else 0,
+            # ── Scatter (indirect stores) ────────────────────────────
+            "use_scatter": self.use_scatter,
+            "scatter_unique_indices": self.scatter_unique_indices if self.use_scatter else True,
             # ── Register-pressure stress ─────────────────────────────
             "use_reg_pressure": self.use_reg_pressure,
             # ── Software-pipelining stress ────────────────────────────

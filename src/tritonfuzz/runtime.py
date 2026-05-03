@@ -146,6 +146,8 @@ class Runtime:
             return self._allocate_dot_inputs(kernel)
         if meta.get("use_gather"):
             return self._allocate_gather_inputs(kernel)
+        if meta.get("use_scatter"):
+            return self._allocate_scatter_inputs(kernel)
         if meta.get("use_pipeline_loop"):
             return self._allocate_pipeline_inputs(kernel)
 
@@ -190,6 +192,11 @@ class Runtime:
         Input 0 is an int32 index tensor whose values are clamped to
         ``[0, n_elements)`` so all gather accesses are in-bounds.
         Remaining inputs are data tensors of the appropriate dtypes.
+
+        When scatter is also active (gather+scatter), the index tensor
+        controls both load and store addressing.  If
+        ``scatter_unique_indices`` is True, the indices form a
+        permutation (deterministic output).
         """
         meta = kernel.metadata
         n_elements = meta.get("n_elements", 1024)
@@ -199,7 +206,13 @@ class Runtime:
         tensors: list[torch.Tensor] = []
 
         # Input 0: index tensor (int32, values in [0, n_elements))
-        idx = torch.randint(0, n_elements, (n_elements,), device=self._device, dtype=torch.int32)
+        use_scatter = meta.get("use_scatter", False)
+        scatter_unique = meta.get("scatter_unique_indices", True)
+        if use_scatter and scatter_unique:
+            # Permutation: each output position written exactly once
+            idx = torch.randperm(n_elements, device=self._device).to(torch.int32)
+        else:
+            idx = torch.randint(0, n_elements, (n_elements,), device=self._device, dtype=torch.int32)
         tensors.append(idx)
 
         # Inputs 1..N: data tensors
@@ -216,6 +229,46 @@ class Runtime:
                 t = torch.randint(low, high, (n_elements,), device=self._device, dtype=dt)
 
             tensors.append(t)
+
+        return tensors
+
+    def _allocate_scatter_inputs(self, kernel: GeneratedKernel) -> list[torch.Tensor]:
+        """Allocate data + scatter-index tensors for a scatter-only kernel.
+
+        Data inputs are standard contiguous tensors.  An additional
+        scatter index tensor (int32, values in ``[0, n_elements)``) is
+        appended at the end of the input list.  This matches the kernel
+        parameter order: ``in_ptr0, in_ptr1, …, scatter_idx_ptr, out_ptr``.
+        """
+        meta = kernel.metadata
+        n_elements = meta.get("n_elements", 1024)
+        num_inputs = meta.get("num_inputs", 1)
+        dtype_strs: list[str] = meta.get("input_dtypes", ["torch.float32"] * num_inputs)
+        scatter_unique = meta.get("scatter_unique_indices", True)
+
+        tensors: list[torch.Tensor] = []
+
+        # Data tensors (standard contiguous)
+        for i in range(num_inputs):
+            dt_str = dtype_strs[i] if i < len(dtype_strs) else "torch.float32"
+            dt = _TORCH_DTYPE_MAP.get(dt_str, torch.float32)
+
+            if dt.is_floating_point:
+                t = torch.randn(n_elements, device=self._device, dtype=dt)
+            else:
+                info = torch.iinfo(dt)
+                low = max(info.min, -127)
+                high = min(info.max, 127) + 1
+                t = torch.randint(low, high, (n_elements,), device=self._device, dtype=dt)
+
+            tensors.append(t)
+
+        # Scatter index tensor (appended after data inputs)
+        if scatter_unique:
+            scatter_idx = torch.randperm(n_elements, device=self._device).to(torch.int32)
+        else:
+            scatter_idx = torch.randint(0, n_elements, (n_elements,), device=self._device, dtype=torch.int32)
+        tensors.append(scatter_idx)
 
         return tensors
 
@@ -288,7 +341,12 @@ class Runtime:
 
         # Initialise output tensor — atomic ops require specific init values
         # so that the first write is an identity (non-overlapping pattern).
+        # Scatter mode also uses zeros so untouched positions (if any) have
+        # a known value for comparison.
+        use_scatter = meta.get("use_scatter", False)
         output_init = meta.get("output_init", "empty")
+        if use_scatter and output_init == "empty":
+            output_init = "zeros"  # scatter needs deterministic init
         if output_init == "zeros":
             out = torch.zeros(n_elements, device=self._device, dtype=output_dtype)
         elif output_init == "neg_inf":

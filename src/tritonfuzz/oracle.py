@@ -127,6 +127,8 @@ _OP_TOLERANCE_MULTIPLIERS: dict[str, float] = {
     # If/else and nested-if do not add numerical error themselves
     "if_else":         1.0,
     "nested_if_in_if": 1.0,
+    # Scatter (indirect stores) – no additional numerical error
+    "scatter_store":   1.0,
 }
 
 # Output dtype → base tolerance override.
@@ -312,7 +314,15 @@ class Oracle:
             op.startswith("atomic") for op in ops_used
         )
 
-        if has_atomics:
+        # Scatter with non-unique indices: write order is
+        # non-deterministic (like atomics), so use relaxed comparison.
+        has_scatter = "scatter_store" in ops_used
+        scatter_non_unique = (
+            has_scatter
+            and not metadata.get("scatter_unique_indices", True)
+        )
+
+        if has_atomics or scatter_non_unique:
             return self._compare_atomic(seed, golden, test, ops_used, metadata)
 
         # --- Phase 3: standard numerical comparison (§6.1–6.2) ------------

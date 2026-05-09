@@ -368,6 +368,8 @@ class KernelBuilder:
                 # Decide index uniqueness: unique (permutation) is
                 # deterministic; non-unique may have write races.
                 self.scatter_unique_indices = rng.random() > 0.40  # 60 % unique
+                if not self.use_atomic or (self.use_atomic and self.atomic_op.name == "atomic_xchg"):
+                    self.scatter_unique_indices = True
                 if not self.use_gather:
                     # Scatter-only: keep n_elements reasonable
                     self.n_elements = rng.choice(_GATHER_N_ELEMENTS_CHOICES)
@@ -2565,7 +2567,18 @@ class KernelBuilder:
                 self._output_var.dtype.torch if self._output_var else "torch.float32"
             )
             lines.append(f"    _out = torch.zeros({scatter_idx_var}.shape[0], dtype={output_dtype_str}, device={out_var}.device)")
-            lines.append(f"    _out[{scatter_idx_var}] = {out_var}")
+            if self.use_atomic:
+                op_name = self.atomic_op.name
+                if op_name == "atomic_add":
+                    lines.append(f"    _out.scatter_add_(0, {scatter_idx_var}.long(), {out_var})")
+                elif op_name == "atomic_max":
+                    lines.append(f"    _out.scatter_reduce_(0, {scatter_idx_var}.long(), {out_var}, reduce='amax', include_self=True)")
+                elif op_name == "atomic_min":
+                    lines.append(f"    _out.scatter_reduce_(0, {scatter_idx_var}.long(), {out_var}, reduce='amin', include_self=True)")
+                else:
+                    lines.append(f"    _out[{scatter_idx_var}] = {out_var}")
+            else:
+                lines.append(f"    _out[{scatter_idx_var}] = {out_var}")
             lines.append("    return _out")
         else:
             lines.append(f"    return {out_var}")

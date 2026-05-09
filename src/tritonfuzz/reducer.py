@@ -510,16 +510,21 @@ class Reducer:
         steps: list[str] = []
         cur_bs = metadata.get("block_size", 256)
         cur_ne = metadata.get("n_elements", 1024)
+        is_tied = (cur_bs == cur_ne)
 
         # Try successively smaller BLOCK_SIZE values
         for bs in _BLOCK_SIZE_LADDER:
             if bs >= cur_bs:
                 continue
             cand = dict(metadata, block_size=bs)
+            if is_tied:
+                cand["n_elements"] = bs
             if self._reproduces(
                 triton_src, torch_src, cand, compile_options, target_verdict,
             ):
                 cur_bs = bs
+                if is_tied:
+                    cur_ne = bs
                 metadata = cand
                 msg = f"BLOCK_SIZE → {bs}"
                 steps.append(msg)
@@ -530,10 +535,14 @@ class Reducer:
             if ne >= cur_ne:
                 continue
             cand = dict(metadata, n_elements=ne)
+            if is_tied:
+                cand["block_size"] = min(cand.get("block_size", 256), ne)
             if self._reproduces(
                 triton_src, torch_src, cand, compile_options, target_verdict,
             ):
                 cur_ne = ne
+                if is_tied:
+                    cur_bs = cand["block_size"]
                 metadata = cand
                 msg = f"n_elements → {ne}"
                 steps.append(msg)

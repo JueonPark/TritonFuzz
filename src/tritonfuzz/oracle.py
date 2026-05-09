@@ -420,6 +420,20 @@ class Oracle:
         # us to apply an unrealistically tight fp32 tolerance.
         output_dtype = _least_precise_float_dtype(golden.dtype, test.dtype)
         input_dtypes: list[str] | None = metadata.get("input_dtypes")
+        
+        # If any input is less precise than the output, use the least precise input 
+        # dtype for tolerance because intermediate calculations use it.
+        if input_dtypes:
+            for dt_str in input_dtypes:
+                if dt_str == "torch.bfloat16":
+                    output_dtype = _least_precise_float_dtype(output_dtype, torch.bfloat16)
+                elif dt_str == "torch.float16":
+                    output_dtype = _least_precise_float_dtype(output_dtype, torch.float16)
+                elif dt_str == "torch.float32":
+                    output_dtype = _least_precise_float_dtype(output_dtype, torch.float32)
+                elif dt_str == "torch.float64":
+                    output_dtype = _least_precise_float_dtype(output_dtype, torch.float64)
+
         atol, rtol = _compute_effective_tolerance(
             self._config.atol, self._config.rtol, ops_used, output_dtype,
             input_dtypes=input_dtypes,
